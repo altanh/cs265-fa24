@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bril_rs::*;
 
@@ -30,4 +30,69 @@ pub fn resolve_labels(func: &Function) -> HashMap<String, usize> {
         }
     }
     map
+}
+
+pub fn collect_vars(func: &Function) -> HashSet<String> {
+    let mut res: HashSet<String> = Default::default();
+    for arg in &func.args {
+        res.insert(arg.name.clone());
+    }
+    for code in &func.instrs {
+        if let Code::Instruction(inst) = code {
+            match inst {
+                Instruction::Constant { dest, .. } | Instruction::Value { dest, .. } => {
+                    res.insert(dest.clone());
+                }
+                _ => (),
+            }
+        }
+    }
+    res
+}
+
+pub type UFNode = u32;
+
+pub struct UnionFind {
+    nodes: Vec<UFNode>,
+}
+
+// TODO(altanh): path compression if it matters
+impl UnionFind {
+    pub fn new() -> UnionFind {
+        UnionFind { nodes: vec![] }
+    }
+
+    pub fn make_node(&mut self) -> UFNode {
+        let r = self.nodes.len() as UFNode;
+        self.nodes.push(r);
+        r
+    }
+
+    pub fn root(&self, mut n: UFNode) -> UFNode {
+        assert!(n < self.nodes.len() as UFNode);
+        while self.nodes[n as usize] != n {
+            n = self.nodes[n as usize];
+        }
+        n
+    }
+
+    pub fn merge(&mut self, x: UFNode, y: UFNode) -> UFNode {
+        let x = self.root(x);
+        let y = self.root(y);
+        let r = if x < y {
+            self.nodes[y as usize] = x;
+            x
+        } else if y < x {
+            self.nodes[x as usize] = y;
+            y
+        } else {
+            // Already merged
+            x
+        };
+        r
+    }
+
+    pub fn equiv(&self, x: UFNode, y: UFNode) -> bool {
+        self.root(x) == self.root(y)
+    }
 }
