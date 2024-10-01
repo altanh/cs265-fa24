@@ -91,17 +91,18 @@ impl HashCons {
         writeln!(f, "digraph {{")?;
         for (se, n) in &self.0 {
             let s = match se {
-                SymExpr::Const(lit) => format!("{:?}", lit),
-                SymExpr::Var((n, loc)) => format!("{}@{:?}", n, loc),
+                SymExpr::Const(lit) => format!("{n} = {:?}", lit),
+                // SymExpr::Var((n, loc)) => format!("{}@{:?}", n, loc),
+                SymExpr::Var((_, loc)) => format!("X{n} @ {loc:?}"),
                 SymExpr::Op(Op::Builtin(op), _) => {
-                    format!("{:?}", op)
+                    format!("{n} = {:?}", op)
                 }
                 SymExpr::Op(Op::Extern(func), _) => {
-                    format!("{}", func)
+                    format!("{n} = {}", func)
                 }
                 SymExpr::Bot => "⊥".to_string(),
             };
-            writeln!(f, "  {} [label=\"{}: {}\"];", n, n, s)?;
+            writeln!(f, "  {} [label=\"{}\"];", n, s)?;
         }
         for (_, phi) in &g.phis {
             for (vars, val) in phi {
@@ -333,8 +334,18 @@ impl<'a> CFG<'a> {
         for node in self.flow.keys() {
             let label = node_label(*node);
             // Escape the newlines in the label
-            let label = label.replace("\n", "\\n");
-            writeln!(f, "  {} [label=\"{}\"];", node_id(*node), label)?;
+            let label = label.replace("\n", "\\l");
+            // Use rectangles for blocks, and left-align text.
+            if let Node::Block(_) = node {
+                writeln!(
+                    f,
+                    "  {} [label=\"{}\", shape=box, align=left];",
+                    node_id(*node),
+                    label
+                )?;
+            } else {
+                writeln!(f, "  {} [label=\"{}\"];", node_id(*node), label)?;
+            }
         }
 
         for (src, dsts) in &self.flow {
@@ -413,7 +424,7 @@ type Phi = HashMap<PhiArgs, ValueNumber>;
 #[derive(Debug, Default)]
 pub struct GlobalPhi {
     pub phis: HashMap<Node, Phi>,
-    pub vars: HashMap<(Node, Var), ValueNumber>,
+    symvars: HashMap<(Vec<Var>, Location), ValueNumber>,
 }
 
 impl Display for GlobalPhi {
@@ -423,13 +434,6 @@ impl Display for GlobalPhi {
             for (vars, val) in phi {
                 writeln!(f, "    {:?} -> {}", vars, val)?;
             }
-        }
-        for ((node, var), val) in &self.vars {
-            let n = match node {
-                Node::Block(n) => n,
-                _ => unreachable!(),
-            };
-            writeln!(f, "({}, {}): {}", n, var, val)?;
         }
         Ok(())
     }
@@ -444,21 +448,54 @@ impl GlobalPhi {
         self.phis.entry(node).or_insert(Default::default())
     }
 
-    fn phi(&mut self, at: Node, var: Var, args: PhiArgs, hc: &mut HashCons) -> ValueNumber {
-        if let Some(&val) = self.entry(at).get(&args) {
-            // Insert the variable
-            self.vars.insert((at, var), val);
-            val
-        } else if let Some(&val) = self.vars.get(&(at, var.clone())) {
-            // Update the entry
-            self.entry(at).insert(args, val);
-            val
-        } else {
-            let val = hc.symbolic_var(at);
-            self.vars.insert((at, var), val);
-            self.entry(at).insert(args, val);
-            val
+    // TODO(altanh): according to the paper, this way of doing it is completely
+    // unnecessary; it should be achievable without tracking the set of
+    // equivalent variables. However, without this I am unable to get a
+    // terminating analysis. Skill issue.
+    fn insert_phis(
+        &mut self,
+        loc: Location,
+        store: HashMap<String, PhiArgs>,
+        hc: &mut HashCons,
+    ) -> AStore {
+        self.clear(loc);
+        // Collect all variables with the same phi arguments
+        let mut vars: HashMap<PhiArgs, Vec<String>> = HashMap::new();
+        for (k, args) in &store {
+            vars.entry(args.clone())
+                .or_insert_with(Vec::new)
+                .push(k.clone());
         }
+        // Create symbolic variables for each set of equal variables and update
+        // phi entries
+        let mut result: AStore = Default::default();
+        for (args, vars) in vars {
+            let val = match args.len() {
+                0 => hc.intern(SymExpr::Bot),
+                1 => args[0].1,
+                _ => {
+                    let val = *self
+                        .symvars
+                        .entry((vars.clone(), loc))
+                        .or_insert_with(|| hc.symbolic_var(loc));
+                    // TODO(altanh): is this valid?
+                    // Filter out recursive uses in the phi arguments
+                    let args: PhiArgs = args.into_iter().filter(|(_, v)| *v != val).collect();
+                    match args.len() {
+                        0 => hc.intern(SymExpr::Bot),
+                        1 => args[0].1,
+                        _ => {
+                            self.entry(loc).insert(args, val);
+                            val
+                        }
+                    }
+                }
+            };
+            for var in vars {
+                result.insert(var, val);
+            }
+        }
+        result
     }
 }
 
@@ -474,7 +511,7 @@ impl Display for HashCons {
 
 fn join(
     stores: Vec<(Node, &Option<AStore>)>,
-    at: Location,
+    loc: Location,
     phis: &mut GlobalPhi,
     hc: &mut HashCons,
 ) -> Option<AStore> {
@@ -488,49 +525,30 @@ fn join(
     if stores.is_empty() {
         None
     } else {
-        phis.clear(at);
         // Merge the stores: each variable is mapped to the list of value
         // numbers it takes on at the join point. We track the source node as
         // well to prevent incorrect phi function equalities.
-        let mut result: HashMap<String, PhiArgs> = HashMap::new();
+        let mut result: HashMap<String, (PhiArgs, HashSet<ValueNumber>)> = HashMap::new();
         for (n, s) in stores {
             for (x, e) in s {
-                result
+                let entry = result
                     .entry(x.clone())
-                    .or_insert_with(Vec::new)
-                    .push((n, *e));
+                    .or_insert_with(|| (vec![], HashSet::new()));
+                // Skip undefined values. Warning: this assumes that the
+                // value number for undefined is always 0. Also skip if the
+                // value number is already present.
+                if *e == 0 || entry.1.contains(e) {
+                    continue;
+                }
+                entry.0.push((n, *e));
+                entry.1.insert(*e);
             }
         }
-        // Insert phi variables
-        Some(
-            result
-                .into_iter()
-                .map(|(k, args)| {
-                    // Remove duplicate and undefined values but keep the order
-                    let mut seen: HashSet<ValueNumber> = HashSet::new();
-                    // Warning: this currently assumes that value number 0 is ⊥
-                    let args: PhiArgs = args
-                        .into_iter()
-                        .filter(|(_, x)| seen.insert(*x) && *x > 0)
-                        .collect();
-                    if args.is_empty() {
-                        // All values are undefined, so the result is undefined
-                        (k, hc.intern(SymExpr::Bot))
-                    } else if args.len() == 1 {
-                        // One value, so no need for a phi
-                        (k, args.into_iter().next().unwrap().1)
-                    } else {
-                        // Insert the phi. Note that all variables with the same
-                        // phi arguments will be mapped to the same symbolic
-                        // variable; this way, phi nodes enjoy the same
-                        // congruence property as regular symbolic expressions.
-                        let symvar = phis.phi(at, k.clone(), args.clone(), hc);
-                        println!("phi({:?}, {:?}, {:?}) = {:?}", args, at, k, symvar);
-                        (k, symvar)
-                    }
-                })
-                .collect(),
-        )
+        Some(phis.insert_phis(
+            loc,
+            result.into_iter().map(|(k, (v, _))| (k, v)).collect(),
+            hc,
+        ))
     }
 }
 
@@ -538,7 +556,7 @@ fn join(
 mod tests {
     use super::*;
     use crate::util::collect_vars;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
 
     #[test]
     fn ssa_blocks() {
@@ -582,24 +600,27 @@ mod tests {
 
             // Initialize worklist with preorder traversal of the CFG
             // let mut stack: Vec<Node> = vec![Node::Entry];
-            // let mut visited: HashSet<Node> = HashSet::new();
-            // let mut worklist: Vec<Node> = vec![];
-            // while let Some(node) = stack.pop() {
-            //     if visited.contains(&node) {
-            //         continue;
-            //     }
-            //     visited.insert(node);
-            //     worklist.push(node);
-            //     if let Some(succs) = cfg.flow.get(&node) {
-            //         for succ in succs {
-            //             stack.push(*succ);
-            //         }
-            //     }
-            // }
-            let mut worklist: Vec<Node> = cfg.flow.keys().cloned().collect();
+            let mut queue: VecDeque<Node> = VecDeque::new();
+            queue.push_back(Node::Entry);
+            let mut visited: HashSet<Node> = HashSet::new();
+            let mut worklist: VecDeque<Node> = VecDeque::new();
+            while let Some(node) = queue.pop_front() {
+                if visited.contains(&node) {
+                    continue;
+                }
+                visited.insert(node);
+                worklist.push_back(node);
+                if let Some(succs) = cfg.flow.get(&node) {
+                    for succ in succs {
+                        queue.push_back(*succ);
+                    }
+                }
+            }
+            println!("worklist: {:?}", worklist);
+            // let mut worklist: Vec<Node> = cfg.flow.keys().cloned().collect();
 
             let mut iter = 0;
-            while let Some(n) = worklist.pop() {
+            while let Some(n) = worklist.pop_front() {
                 println!("iter {iter} at {n:?}: ");
                 if let Node::Block(i) = n {
                     // assert!(cfg.flow_r[&n].len() <= 1);
@@ -635,7 +656,7 @@ mod tests {
                             }
                             abs.insert(n, astore.clone());
                             for succ in &cfg.flow[&n] {
-                                worklist.push(*succ);
+                                worklist.push_back(*succ);
                             }
                         }
                     } else {
@@ -644,7 +665,7 @@ mod tests {
                 } else {
                     // Always push successors for entry and exit nodes
                     for succ in &cfg.flow[&n] {
-                        worklist.push(*succ);
+                        worklist.push_back(*succ);
                     }
                 }
                 iter += 1;
