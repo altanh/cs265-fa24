@@ -57,13 +57,15 @@ impl From<SymVar> for SymExpr {
 }
 
 #[derive(Debug, Default)]
-pub struct HashCons(HashMap<SymExpr, ValueNumber>);
+pub struct HashCons(HashMap<SymExpr, ValueNumber>, HashMap<ValueNumber, SymExpr>);
 
 impl HashCons {
     /// Warning: this will always return a new value number!
     pub fn symbolic_var(&mut self, loc: Location) -> ValueNumber {
         let n = self.0.len();
-        self.0.insert(SymExpr::Var((n, loc)), n);
+        let v = SymExpr::Var((n, loc));
+        self.0.insert(v.clone(), n);
+        self.1.insert(n, v);
         n
     }
 
@@ -72,13 +74,14 @@ impl HashCons {
             *n
         } else {
             let n = self.0.len();
-            self.0.insert(se, n);
+            self.0.insert(se.clone(), n);
+            self.1.insert(n, se);
             n
         }
     }
 
-    pub fn transpose(&self) -> HashMap<ValueNumber, SymExpr> {
-        self.0.iter().map(|(k, v)| (*v, k.clone())).collect()
+    pub fn transpose(&self) -> &HashMap<ValueNumber, SymExpr> {
+        &self.1
     }
 
     pub fn dot<F>(&self, f: &mut F, g: &GlobalPhi) -> io::Result<()>
@@ -271,7 +274,10 @@ impl<'a> CFG<'a> {
                         ..
                     } => {
                         for target in labels {
-                            let target: Node = label_map.get(target).cloned().unwrap().into();
+                            let target: Node = label_map
+                                .get(target)
+                                .cloned()
+                                .map_or(Node::Exit, Node::Block);
                             fb.flows(Node::Block(i), target);
                         }
                     }
