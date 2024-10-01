@@ -1,0 +1,17 @@
+@main {
+    x: int = const 0;
+    y: int = const 0;
+    one: int = const 1;
+.foo:
+    z: bool = eq x y;
+    br z .a .b;
+.a:
+    w: bool = eq y one;
+    br w .b .c;
+.c:
+    x: int = const 2;
+    y: int = const 1;
+    jmp .foo;
+.b:
+    ret x;
+}

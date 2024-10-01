@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     fmt::Display,
     io,
 };
@@ -87,12 +87,23 @@ impl HashCons {
     {
         writeln!(f, "digraph {{")?;
         for (se, n) in &self.0 {
-            writeln!(f, "  {} [label=\"{:?}\"];", n, se)?;
+            let s = match se {
+                SymExpr::Const(lit) => format!("{:?}", lit),
+                SymExpr::Var((n, loc)) => format!("{}@{:?}", n, loc),
+                SymExpr::Op(Op::Builtin(op), _) => {
+                    format!("{:?}", op)
+                }
+                SymExpr::Op(Op::Extern(func), _) => {
+                    format!("{}", func)
+                }
+                SymExpr::Bot => "⊥".to_string(),
+            };
+            writeln!(f, "  {} [label=\"{}: {}\"];", n, n, s)?;
         }
         for (_, phi) in &g.phis {
             for (vars, val) in phi {
                 for v in vars {
-                    writeln!(f, "  {} -> {};", val, v)?;
+                    writeln!(f, "  {} -> {};", val, v.1)?;
                 }
             }
         }
@@ -110,14 +121,6 @@ impl HashCons {
 
 /// TODO(altanh): functional map
 pub type AStore = HashMap<Var, ValueNumber>;
-
-// #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-// pub enum Lifted<T> {
-//     Value(T),
-//     Bot,
-// }
-
-type Lifted<T> = Option<T>;
 
 #[derive(Default, Clone, PartialEq, Eq)]
 pub struct Block {
@@ -398,13 +401,13 @@ fn step_symbolic(i: &Instruction, ctx: &mut AStore, hc: &mut HashCons) {
     }
 }
 
-type Phi = HashMap<Vec<ValueNumber>, ValueNumber>;
-// type GlobalPhi = HashMap<Node, Phi>;
+type PhiArgs = Vec<(Node, ValueNumber)>;
+type Phi = HashMap<PhiArgs, ValueNumber>;
 
 #[derive(Debug, Default)]
-struct GlobalPhi {
+pub struct GlobalPhi {
     pub phis: HashMap<Node, Phi>,
-    vars: HashMap<(Node, Var), ValueNumber>,
+    pub vars: HashMap<(Node, Var), ValueNumber>,
 }
 
 impl Display for GlobalPhi {
@@ -427,33 +430,27 @@ impl Display for GlobalPhi {
 }
 
 impl GlobalPhi {
+    fn clear(&mut self, at: Node) {
+        self.phis.remove(&at);
+    }
+
     fn entry(&mut self, node: Node) -> &mut Phi {
         self.phis.entry(node).or_insert(Default::default())
     }
 
-    fn phi(&mut self, v: Vec<ValueNumber>, node: Node, var: Var, hc: &mut HashCons) -> ValueNumber {
-        if let Some(&val) = self.entry(node).get(&v) {
+    fn phi(&mut self, at: Node, var: Var, args: PhiArgs, hc: &mut HashCons) -> ValueNumber {
+        if let Some(&val) = self.entry(at).get(&args) {
             // Insert the variable
-            self.vars.insert((node, var), val);
+            self.vars.insert((at, var), val);
             val
-        } else if let Some(&val) = self.vars.get(&(node, var.clone())) {
-            // Remove all entries in self.phis[node] that have val as the value
-            let mut to_remove: Vec<Vec<ValueNumber>> = vec![];
-            for (vars, v) in self.entry(node) {
-                if *v == val {
-                    to_remove.push(vars.clone());
-                }
-            }
-            for vars in to_remove {
-                self.entry(node).remove(&vars);
-            }
+        } else if let Some(&val) = self.vars.get(&(at, var.clone())) {
             // Update the entry
-            self.entry(node).insert(v, val);
+            self.entry(at).insert(args, val);
             val
         } else {
-            let val = hc.symbolic_var(node);
-            self.vars.insert((node, var), val);
-            self.entry(node).insert(v, val);
+            let val = hc.symbolic_var(at);
+            self.vars.insert((at, var), val);
+            self.entry(at).insert(args, val);
             val
         }
     }
@@ -470,68 +467,60 @@ impl Display for HashCons {
 }
 
 fn join(
-    stores: Vec<(Node, &Lifted<AStore>)>,
+    stores: Vec<(Node, &Option<AStore>)>,
     at: Location,
-    g: &mut GlobalPhi,
+    phis: &mut GlobalPhi,
     hc: &mut HashCons,
-) -> Lifted<AStore> {
-    // Filter out non-bot stores
+) -> Option<AStore> {
+    // Filter out undefined stores
     let mut stores: Vec<(Node, &AStore)> = stores
-        .iter()
-        .filter_map(|a| {
-            if let (n, Lifted::Some(a)) = a {
-                Some((*n, a))
-            } else {
-                None
-            }
-        })
+        .into_iter()
+        .filter_map(|(n, a)| Some((n, a.as_ref()?)))
         .collect();
+    // Sort the stores by source node for consistency
+    stores.sort_by_key(|(n, _)| *n);
     if stores.is_empty() {
-        Lifted::None
+        None
     } else {
-        // Merge the stores key-wise; keep merged value numbers in sorted order
-        stores.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut stores: Vec<&AStore> = stores.into_iter().map(|(_, a)| a).collect();
-        let mut result: HashMap<String, Vec<ValueNumber>> = stores
-            .pop()
-            .unwrap()
-            .into_iter()
-            .map(|(k, v)| (k.clone(), vec![*v]))
-            .collect();
-        for s in stores {
+        phis.clear(at);
+        // Merge the stores: each variable is mapped to the list of value
+        // numbers it takes on at the join point. We track the source node as
+        // well to prevent incorrect phi function equalities.
+        let mut result: HashMap<String, PhiArgs> = HashMap::new();
+        for (n, s) in stores {
             for (x, e) in s {
-                match result.get_mut(x) {
-                    None => {
-                        result.insert(x.clone(), vec![*e]);
-                    }
-                    Some(v) => {
-                        v.push(*e);
-                    }
-                }
+                result
+                    .entry(x.clone())
+                    .or_insert_with(Vec::new)
+                    .push((n, *e));
             }
         }
         // Insert phi variables
-        Lifted::Some(
+        Some(
             result
                 .into_iter()
-                .map(|(k, v)| {
-                    // Remove duplicates but keep the order
+                .map(|(k, args)| {
+                    // Remove duplicate and undefined values but keep the order
                     let mut seen: HashSet<ValueNumber> = HashSet::new();
-                    let v: Vec<ValueNumber> = v
+                    // Warning: this currently assumes that value number 0 is ⊥
+                    let args: PhiArgs = args
                         .into_iter()
-                        .filter(|x| seen.insert(*x) && *x > 0)
+                        .filter(|(_, x)| seen.insert(*x) && *x > 0)
                         .collect();
-                    if v.is_empty() {
+                    if args.is_empty() {
+                        // All values are undefined, so the result is undefined
                         (k, hc.intern(SymExpr::Bot))
-                    } else if v.len() == 1 {
-                        (k, v.into_iter().next().unwrap())
+                    } else if args.len() == 1 {
+                        // One value, so no need for a phi
+                        (k, args.into_iter().next().unwrap().1)
                     } else {
-                        // let v = phi
-                        //     .entry(v.into_iter().collect())
-                        //     // .or_insert(hc.symbolic_var(at));
-                        let var = g.phi(v.clone(), at, k.clone(), hc);
-                        println!("phi({:?}, {:?}, {:?}) = {:?}", v, at, k, var);
-                        (k, var)
+                        // Insert the phi. Note that all variables with the same
+                        // phi arguments will be mapped to the same symbolic
+                        // variable; this way, phi nodes enjoy the same
+                        // congruence property as regular symbolic expressions.
+                        let symvar = phis.phi(at, k.clone(), args.clone(), hc);
+                        println!("phi({:?}, {:?}, {:?}) = {:?}", args, at, k, symvar);
+                        (k, symvar)
                     }
                 })
                 .collect(),
@@ -579,11 +568,11 @@ mod tests {
                 }
             }
 
-            let mut abs: HashMap<Node, Lifted<AStore>> = HashMap::new();
+            let mut abs: HashMap<Node, Option<AStore>> = HashMap::new();
             for node in cfg.flow.keys() {
-                abs.insert(*node, Lifted::None);
+                abs.insert(*node, None);
             }
-            abs.insert(Node::Entry, Lifted::Some(initial));
+            abs.insert(Node::Entry, Some(initial));
 
             // Initialize worklist with preorder traversal of the CFG
             // let mut stack: Vec<Node> = vec![Node::Entry];
@@ -609,21 +598,21 @@ mod tests {
                 if let Node::Block(i) = n {
                     // assert!(cfg.flow_r[&n].len() <= 1);
                     // let mut astore = abs[&n].clone();
-                    let ps: Vec<(Node, &Lifted<AStore>)> =
+                    let ps: Vec<(Node, &Option<AStore>)> =
                         cfg.flow_r[&n].iter().map(|m| (*m, &abs[m])).collect();
                     let astore = join(ps, n, &mut phis, &mut hc);
                     // let astore = abs[cfg.flow_r[&n].iter().next().unwrap()].clone();
-                    if let Lifted::Some(mut astore) = astore {
+                    if let Some(mut astore) = astore {
                         // Symbolically execute the block
                         for inst in &cfg.blocks[i].insts {
                             step_symbolic(inst, &mut astore, &mut hc);
                         }
                         // If something changed, push successors
-                        let astore = Lifted::Some(astore);
+                        let astore = Some(astore);
                         if astore != abs[&n] {
                             // Print the diff
                             println!("update at {:?}", n);
-                            if let Lifted::Some(astore) = &astore {
+                            if let Some(astore) = &astore {
                                 let ch = hc.transpose();
                                 for (var, val) in astore {
                                     println!(
@@ -653,9 +642,6 @@ mod tests {
                     }
                 }
                 iter += 1;
-                // if iter > 15 {
-                //     break;
-                // }
             }
 
             // Print the abstract store at each block
@@ -669,7 +655,7 @@ mod tests {
                     _ => format!("{:?}", node),
                 };
                 println!("{node_name}:");
-                if let Lifted::Some(store) = store {
+                if let Some(store) = store {
                     for (var, val) in store {
                         println!("    {}: {:?}", var, ch[val]);
                     }
