@@ -1,0 +1,12 @@
+@main(x: int): int {
+    z: int = const 0;
+    w: int = id x;
+    b: bool = le x z;
+    br b .t .f;
+.t:
+    y: int = add x w;
+    ret y;
+.f:
+    y: int = add x x;
+    ret y;
+}

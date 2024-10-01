@@ -1,0 +1,14 @@
+@main(x: bool) {
+    z: int = const -1;
+    br x .t .f;
+.dead:
+    z: int = const 2;
+    jmp .end;
+.t:
+    z: int = const 1;
+    jmp .end;
+.f:
+    z: int = const 0;
+.end:
+    ret z;
+}

@@ -1,0 +1,31 @@
+@main(n: int) {
+    i: int = const 0;
+    x: int = const 1;
+    one: int = const 1;
+.c:
+    b: bool = lt i n;
+    br b .body .exit;
+.body:
+    x: int = add x i;
+    i: int = add i one;
+    jmp .c;
+.exit:
+    ret x;
+}
+
+#@main2(n: int) {
+#    i0: int = const 0;
+#    x0: int = const 1;
+#    one: int = const 1;
+#.c:
+#    x1: int = phi x0 x2;
+#    i1: int = phi i0 i2;
+#    b: bool = lt i1 n;
+#    br b .body .exit;
+#.body:
+#    x2: int = add x i1;
+#    i2: int = add i1 one;
+#    jmp .c;
+#.exit:
+#    ret x;
+#}
