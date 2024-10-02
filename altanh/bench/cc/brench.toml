@@ -5,16 +5,18 @@ extract = 'total_dyn_inst: (\d+)'
 [runs.baseline]
 pipeline = ["bril2json", "brili -p {args}"]
 
-[runs.dce]
+[runs.valnum-dce]
 pipeline = [
     "bril2json",
+    "../../../tylerhou_opt/_build/install/default/bin/opt",
     "cargo run --manifest-path ../../Cargo.toml -- dce",
     "brili -p {args}",
 ]
 
-[runs.valnum-dce]
+[runs.cc-valnum-dce]
 pipeline = [
     "bril2json",
+    "cargo run --manifest-path ../../Cargo.toml -- cc",
     "../../../tylerhou_opt/_build/install/default/bin/opt",
     "cargo run --manifest-path ../../Cargo.toml -- dce",
     "brili -p {args}",
