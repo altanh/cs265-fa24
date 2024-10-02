@@ -8,6 +8,9 @@ fn main() {
 
     let mut new_funcs = vec![];
 
+    // Parse the pass sequence: ./altanh <pass1> <pass2> ...
+    let passes: Vec<String> = std::env::args().skip(1).collect();
+
     for func in &prog.functions {
         let cfg = ControlFlowGraph::new(func);
 
@@ -18,8 +21,23 @@ fn main() {
             cfg.dot(&mut file).unwrap();
         }
 
-        let func = altanh::opt::cc(&func);
-        let func = altanh::opt::dce(&func);
+        let mut func = func.clone();
+        for pass in &passes {
+            match pass.as_str() {
+                "cc" => {
+                    eprintln!("Running CC...");
+                    func = altanh::opt::cc(&func);
+                }
+                "dce" => {
+                    eprintln!("Running DCE...");
+                    func = altanh::opt::dce(&func);
+                }
+                _ => {
+                    eprintln!("Unknown pass: {}", pass);
+                    std::process::exit(1);
+                }
+            }
+        }
 
         if WRITE_CFG {
             let cfg = ControlFlowGraph::new(&func);
