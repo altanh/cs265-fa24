@@ -1,6 +1,6 @@
-use bril_rs::{Code, EffectOps, Function, Instruction, Literal, ValueOps};
+use bril_rs::{EffectOps, Instruction, Literal, ValueOps};
 
-use crate::cfg::{ControlFlowGraph, Node};
+use crate::cfg::{Block, Node, CFG};
 /// Monotone framework
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
@@ -19,7 +19,6 @@ where
 {
     fn join(&self, other: &Self) -> Self;
     fn bot(&self) -> Self;
-    // fn top(&self) -> Self;
 
     fn leq(&self, other: &Self) -> bool {
         // a <= b iff a ⊔ b = b
@@ -28,11 +27,11 @@ where
     }
 }
 
-#[derive(Clone)]
-struct IntersectionSemilattice<'a, T> {
-    universe: &'a HashSet<T>,
-    set: HashSet<T>,
-}
+// #[derive(Clone)]
+// struct IntersectionSemilattice<'a, T> {
+//     universe: &'a HashSet<T>,
+//     set: HashSet<T>,
+// }
 
 impl<T> Semilattice for HashSet<T>
 where
@@ -53,35 +52,35 @@ where
     }
 }
 
-impl<'a, T> PartialEq for IntersectionSemilattice<'a, T>
-where
-    T: Eq + Hash,
-{
-    fn eq(&self, other: &Self) -> bool {
-        self.set == other.set
-    }
-}
+// impl<'a, T> PartialEq for IntersectionSemilattice<'a, T>
+// where
+//     T: Eq + Hash,
+// {
+//     fn eq(&self, other: &Self) -> bool {
+//         self.set == other.set
+//     }
+// }
 
-impl<'a, T> Semilattice for IntersectionSemilattice<'a, T>
-where
-    T: Eq + Hash + Clone,
-{
-    fn bot(&self) -> Self {
-        Self {
-            universe: self.universe,
-            set: self.universe.clone(),
-        }
-    }
-    fn join(&self, other: &Self) -> Self {
-        Self {
-            universe: self.universe,
-            set: self.set.intersection(&other.set).cloned().collect(),
-        }
-    }
-    fn leq(&self, other: &Self) -> bool {
-        self.set.is_superset(&other.set)
-    }
-}
+// impl<'a, T> Semilattice for IntersectionSemilattice<'a, T>
+// where
+//     T: Eq + Hash + Clone,
+// {
+//     fn bot(&self) -> Self {
+//         Self {
+//             universe: self.universe,
+//             set: self.universe.clone(),
+//         }
+//     }
+//     fn join(&self, other: &Self) -> Self {
+//         Self {
+//             universe: self.universe,
+//             set: self.set.intersection(&other.set).cloned().collect(),
+//         }
+//     }
+//     fn leq(&self, other: &Self) -> bool {
+//         self.set.is_superset(&other.set)
+//     }
+// }
 
 impl<S, T> Semilattice for (S, T)
 where
@@ -128,30 +127,84 @@ where
     }
 }
 
-/// 1. Lattice
-/// 2. Initial value for initial node (i.e. entry or exit)
-/// 3. Monotone transfer function for each node
-pub struct MonotoneFramework<T, F> {
-    pub direction: Direction,
-    pub initial_value: T,
-    pub transfer: F,
+pub type AbstractStore<T> = HashMap<String, T>;
+
+pub struct AnalysisResult<T> {
+    pub value_in: HashMap<Node, T>,
+    pub value_out: HashMap<Node, T>,
 }
 
-impl<T, F> MonotoneFramework<T, F>
+impl<T> AnalysisResult<T>
 where
-    T: Semilattice + Debug,
-    F: Fn(Node, &T) -> T,
+    T: Semilattice,
 {
-    pub fn run(&self, cfg: &ControlFlowGraph) -> HashMap<Node, T> {
-        let (flow, flow_r, initial) = match self.direction {
+    pub fn new(
+        bot: &T,
+        flow_r: &HashMap<Node, HashSet<Node>>,
+        value_out: HashMap<Node, T>,
+    ) -> Self {
+        let mut value_in = HashMap::new();
+        // For each node, join the predecessors to get its in-value
+        for node in value_out.keys() {
+            let in_value = flow_r[node]
+                .iter()
+                .map(|pred| &value_out[pred])
+                .fold(bot.clone(), |acc, x| acc.join(x));
+            value_in.insert(*node, in_value);
+        }
+        AnalysisResult {
+            value_in,
+            value_out,
+        }
+    }
+}
+
+/// 1. Lattice
+/// 2. Initial value for initial node (i.e. entry or exit)
+/// 3. Monotone transfer function for each instruction
+
+pub trait MonotoneAnalysis<T>
+where
+    T: Semilattice,
+{
+    fn direction(&self) -> Direction;
+    fn initial_value(&self) -> T;
+    fn transfer(&self, inst: &Instruction, loc: Node, value: &mut T);
+
+    fn block_transfer(&self, block: &Block, loc: Node, value_in: &mut T) {
+        match self.direction() {
+            Direction::Forward => {
+                for inst in &block.insts {
+                    self.transfer(inst, loc, value_in);
+                }
+                if let Some(term) = &block.term {
+                    self.transfer(term, loc, value_in);
+                }
+            }
+            Direction::Backward => {
+                if let Some(term) = &block.term {
+                    self.transfer(term, loc, value_in);
+                }
+                for inst in block.insts.iter().rev() {
+                    self.transfer(inst, loc, value_in);
+                }
+            }
+        }
+    }
+
+    fn run(&self, cfg: &CFG) -> AnalysisResult<T>
+    where
+        T: Debug,
+    {
+        let (flow, flow_r, initial) = match self.direction() {
             Direction::Forward => (&cfg.flow, &cfg.flow_r, Node::Entry),
             Direction::Backward => (&cfg.flow_r, &cfg.flow, Node::Exit),
         };
         let mut values: HashMap<Node, T> = HashMap::new();
         for node in flow.keys() {
-            values.insert(*node, self.initial_value.bot());
+            values.insert(*node, self.initial_value().bot());
         }
-        values.insert(initial, self.initial_value.clone());
+        values.insert(initial, self.initial_value());
 
         // Initialize worklist with preorder traversal
         let mut worklist: VecDeque<Node> = VecDeque::new();
@@ -173,19 +226,19 @@ where
 
         // Iterate until convergence (pull-based)
         while let Some(node) = worklist.pop_front() {
+            if node == initial {
+                continue;
+            }
             let old = &values[&node];
             // Fold over predecessors
-            let joined = flow_r[&node]
+            let mut new = flow_r[&node]
                 .iter()
                 .map(|pred| &values[pred])
-                .fold(self.initial_value.bot(), |acc, x| acc.join(&x));
-            let new = (self.transfer)(node, &joined);
-            // match node {
-            //     Node::Inst(j) => eprintln!("-- {}", &cfg.func.instrs[j]),
-            //     _ => eprintln!("-- {node:?}"),
-            // }
-            // eprintln!("  old: {old:?}");
-            // eprintln!("  new: {new:?}");
+                .fold(self.initial_value().bot(), |acc, x| acc.join(&x));
+            if let Node::Block(index) = node {
+                self.block_transfer(&cfg.blocks[index], node, &mut new);
+            }
+            // eprintln!("node: {:?}, old: {:?}, new: {:?}", node, old, new);
             if !new.leq(old) {
                 values.insert(node, new);
                 for next in &flow[&node] {
@@ -193,103 +246,140 @@ where
                 }
             }
         }
-        values
+
+        AnalysisResult::new(&self.initial_value().bot(), flow_r, values)
+    }
+
+    /// Apply a function to each instruction in a block, in the order specified
+    /// by the direction. The function is applied before the transfer function
+    /// is executed.
+    fn for_each_before<F>(&self, block: &Block, loc: Node, value_in: &mut T, mut f: F)
+    where
+        F: FnMut(&Instruction, &T),
+    {
+        match self.direction() {
+            Direction::Forward => {
+                for inst in &block.insts {
+                    f(inst, value_in);
+                    self.transfer(inst, loc, value_in);
+                }
+                if let Some(term) = &block.term {
+                    f(term, value_in);
+                    self.transfer(term, loc, value_in);
+                }
+            }
+            Direction::Backward => {
+                if let Some(term) = &block.term {
+                    f(term, value_in);
+                    self.transfer(term, loc, value_in);
+                }
+                for inst in block.insts.iter().rev() {
+                    f(inst, value_in);
+                    self.transfer(inst, loc, value_in);
+                }
+            }
+        }
+    }
+
+    /// Apply a function to each instruction in a block, in the order specified
+    /// by the direction. The function is applied after the transfer function is
+    /// executed.
+    fn for_each_after<F>(&self, block: &Block, loc: Node, value_in: &mut T, mut f: F)
+    where
+        F: FnMut(&Instruction, &T),
+    {
+        match self.direction() {
+            Direction::Forward => {
+                for inst in &block.insts {
+                    self.transfer(inst, loc, value_in);
+                    f(inst, value_in);
+                }
+                if let Some(term) = &block.term {
+                    self.transfer(term, loc, value_in);
+                    f(term, value_in);
+                }
+            }
+            Direction::Backward => {
+                if let Some(term) = &block.term {
+                    self.transfer(term, loc, value_in);
+                    f(term, value_in);
+                }
+                for inst in block.insts.iter().rev() {
+                    self.transfer(inst, loc, value_in);
+                    f(inst, value_in);
+                }
+            }
+        }
     }
 }
 
-// pub fn live_variables(func: &Function) -> HashMap<Node, HashSet<String>> {
-//     type L = HashSet<String>;
-//     let direction = Direction::Backward;
-//     let initial_value: L = HashSet::new();
-//     // TODO: optimize using bitvectors
-//     let transfer = |x: Node, l: &L| -> L {
-//         match x {
-//             Node::Entry => l.clone(),
-//             Node::Exit => l.bot(),
-//             Node::Inst(offset) => {
-//                 use Instruction::*;
-//                 if let Code::Instruction(inst) = &func.instrs[offset] {
-//                     match inst {
-//                         Constant { dest, .. } => {
-//                             let mut l = l.clone();
-//                             l.remove(dest);
-//                             l
-//                         }
-//                         Value { dest, args, .. } => {
-//                             let mut l = l.clone();
-//                             l.remove(dest);
-//                             let gen: HashSet<String> = args.iter().cloned().collect();
-//                             l.union(&gen).cloned().collect()
-//                         }
-//                         Effect { args, .. } => {
-//                             let gen: HashSet<String> = args.iter().cloned().collect();
-//                             l.union(&gen).cloned().collect()
-//                         }
-//                     }
-//                 } else {
-//                     unreachable!();
-//                 }
-//             }
-//         }
-//     };
-//     let analysis = MonotoneFramework {
-//         direction,
-//         initial_value,
-//         transfer,
-//     };
-//     let cfg = ControlFlowGraph::new(func);
-//     analysis.run(&cfg)
-// }
+pub struct LiveVariables;
+
+impl MonotoneAnalysis<HashSet<String>> for LiveVariables {
+    fn direction(&self) -> Direction {
+        Direction::Backward
+    }
+
+    fn initial_value(&self) -> HashSet<String> {
+        HashSet::new()
+    }
+
+    fn transfer(&self, inst: &Instruction, _loc: Node, xs: &mut HashSet<String>) {
+        use Instruction::*;
+        match inst {
+            Constant { dest, .. } => {
+                xs.remove(dest);
+            }
+            Value { dest, args, .. } => {
+                xs.remove(dest);
+                xs.extend(args.iter().cloned());
+            }
+            Effect { args, .. } => {
+                xs.extend(args.iter().cloned());
+            }
+        }
+    }
+}
+
+pub fn live_variables(cfg: &CFG) -> AnalysisResult<HashSet<String>> {
+    LiveVariables.run(cfg)
+}
 
 /// Observable variables.
 /// A variable is observable after an instruction if it is used by some
 /// effectful instruction after that instruction.
-pub fn observable_variables(func: &Function) -> HashMap<Node, HashSet<String>> {
-    type L = HashSet<String>;
-    let direction = Direction::Backward;
-    let initial_value: L = HashSet::new();
-    let transfer = |x: Node, l: &L| -> L {
-        match x {
-            Node::Entry => l.bot(),
-            Node::Exit => l.bot(),
-            Node::Inst(offset) => {
-                use Instruction::*;
-                if let Code::Instruction(inst) = &func.instrs[offset] {
-                    match inst {
-                        Constant { dest, .. } => {
-                            let mut l = l.clone();
-                            l.remove(dest);
-                            l
-                        }
-                        Value { dest, args, .. } => {
-                            // if dest is in l, then all args are observable
-                            let mut l = l.clone();
-                            if l.contains(dest) {
-                                l.remove(dest);
-                                let gen: HashSet<String> = args.iter().cloned().collect();
-                                l.union(&gen).cloned().collect()
-                            } else {
-                                l
-                            }
-                        }
-                        Effect { args, .. } => {
-                            let gen = args.iter().cloned().collect();
-                            l.union(&gen).cloned().collect()
-                        }
-                    }
-                } else {
-                    unreachable!();
+pub struct ObservableVariables;
+
+impl MonotoneAnalysis<HashSet<String>> for ObservableVariables {
+    fn direction(&self) -> Direction {
+        Direction::Backward
+    }
+
+    fn initial_value(&self) -> HashSet<String> {
+        HashSet::new()
+    }
+
+    fn transfer(&self, inst: &Instruction, _loc: Node, xs: &mut HashSet<String>) {
+        use Instruction::*;
+        match inst {
+            Constant { dest, .. } => {
+                xs.remove(dest);
+            }
+            Value { dest, args, .. } => {
+                if xs.contains(dest) {
+                    xs.remove(dest);
+                    xs.extend(args.iter().cloned());
                 }
             }
+            Effect { args, .. } => {
+                xs.extend(args.iter().cloned());
+            }
         }
-    };
-    let analysis = MonotoneFramework {
-        direction,
-        initial_value,
-        transfer,
-    };
-    let cfg = ControlFlowGraph::new(func);
-    analysis.run(&cfg)
+    }
+}
+
+pub fn observable_variables(cfg: &CFG) -> AnalysisResult<HashSet<String>> {
+    ObservableVariables.run(cfg)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -354,7 +444,9 @@ impl From<Literal> for ConstantLattice {
     }
 }
 
-type ConditionalConstantLattice = (HashMap<String, ConstantLattice>, HashSet<Node>);
+// type ConditionalConstantLattice = (HashMap<String, ConstantLattice>,
+// HashSet<Node>);
+type ConditionalConstantLattice = (AbstractStore<ConstantLattice>, HashSet<Node>);
 
 fn const_eval(env: &HashMap<String, ConstantLattice>, inst: &Instruction) -> ConstantLattice {
     use ConstantLattice::*;
@@ -363,10 +455,12 @@ fn const_eval(env: &HashMap<String, ConstantLattice>, inst: &Instruction) -> Con
         Constant { value, .. } => value.clone().into(),
         Value { op, args, .. } => {
             use ValueOps::*;
-            let args: Vec<ConstantLattice> = args.iter().map(|arg| env[arg]).collect();
-            // check that no arguments are bot
+            let args: Vec<ConstantLattice> = args
+                .iter()
+                .map(|arg| env.get(arg).cloned().unwrap_or(ConstantLattice::Bot))
+                .collect();
             if args.iter().any(|arg| arg == &Bot) {
-                panic!("undefined value in instruction {}", inst);
+                eprintln!("WARNING: undefined behavior detected at instruction: [{inst}]");
             }
             match op {
                 Add => match (&args[0], &args[1]) {
@@ -427,98 +521,92 @@ fn const_eval(env: &HashMap<String, ConstantLattice>, inst: &Instruction) -> Con
     }
 }
 
-pub fn conditional_constant(func: &Function) -> HashMap<Node, ConditionalConstantLattice> {
-    let cfg = ControlFlowGraph::new(func);
-    let direction = Direction::Forward;
-    let initial_value = {
-        let mut initial_env: HashMap<String, ConstantLattice> = HashMap::new();
-        // Function arguments get top
-        for arg in &func.args {
-            initial_env.insert(arg.name.clone(), ConstantLattice::Top);
-        }
-        let initial_reachable: HashSet<Node> = cfg.flow[&Node::Entry].iter().cloned().collect();
+pub struct ConditionalConstant<'a> {
+    pub cfg: &'a CFG<'a>,
+}
+
+impl<'a> MonotoneAnalysis<ConditionalConstantLattice> for ConditionalConstant<'a> {
+    fn direction(&self) -> Direction {
+        Direction::Forward
+    }
+
+    fn initial_value(&self) -> ConditionalConstantLattice {
+        // Function parameters get top
+        let initial_env = self
+            .cfg
+            .func
+            .args
+            .iter()
+            .map(|arg| (arg.name.clone(), ConstantLattice::Top))
+            .collect();
+        let initial_reachable: HashSet<Node> =
+            self.cfg.flow[&Node::Entry].iter().cloned().collect();
         (initial_env, initial_reachable)
-    };
-    let transfer = |x: Node, l: &ConditionalConstantLattice| -> ConditionalConstantLattice {
-        let (env, reachable) = l;
-        if reachable.contains(&x) {
-            match x {
-                Node::Entry => l.clone(),
-                Node::Exit => l.bot(),
-                Node::Inst(offset) => {
-                    use Instruction::*;
-                    if let Code::Instruction(inst) = &func.instrs[offset] {
-                        match inst {
-                            Constant { dest, .. } | Value { dest, .. } => {
-                                let c = const_eval(env, inst);
-                                let mut next_env = env.clone();
-                                next_env.insert(dest.clone(), c);
-                                let mut r = reachable.clone();
-                                // insert successor
-                                for next in &cfg.flow[&x] {
-                                    r.insert(*next);
-                                }
-                                (next_env, r)
-                            }
-                            Effect {
-                                op: EffectOps::Jump,
-                                labels,
-                                ..
-                            } => {
-                                let mut r = reachable.clone();
-                                for label in labels {
-                                    r.insert(cfg.resolve(label));
-                                }
-                                (env.clone(), r)
-                            }
-                            Effect {
-                                op: EffectOps::Branch,
-                                labels,
-                                args,
-                                ..
-                            } => {
-                                // Look up the value of the condition; if it
-                                // hasn't been defined, then we are in undefined behavior.
-                                let cond =
-                                    env.get(&args[0]).cloned().unwrap_or(ConstantLattice::Bot);
-                                let mut r = reachable.clone();
-                                match cond {
-                                    ConstantLattice::Bool(true) => {
-                                        r.insert(cfg.resolve(&labels[0]));
-                                    }
-                                    ConstantLattice::Bool(false) => {
-                                        r.insert(cfg.resolve(&labels[1]));
-                                    }
-                                    ConstantLattice::Top => {
-                                        r.insert(cfg.resolve(&labels[0]));
-                                        r.insert(cfg.resolve(&labels[1]));
-                                    }
-                                    ConstantLattice::Bot => (),
-                                    _ => panic!("condition is not a boolean"),
-                                }
-                                (env.clone(), r)
-                            }
-                            _ => {
-                                let mut r = reachable.clone();
-                                for next in &cfg.flow[&x] {
-                                    r.insert(*next);
-                                }
-                                (env.clone(), r)
-                            }
-                        }
-                    } else {
-                        unreachable!();
+    }
+
+    fn block_transfer(&self, block: &Block, loc: Node, value_in: &mut ConditionalConstantLattice) {
+        // Only process the block if it is reachable
+        if value_in.1.contains(&loc) {
+            for inst in &block.insts {
+                self.transfer(inst, loc, value_in);
+            }
+            match &block.term {
+                Some(term) => self.transfer(term, loc, value_in),
+                None => {
+                    // If no terminator, then all successors are reachable
+                    for next in &self.cfg.flow[&loc] {
+                        value_in.1.insert(*next);
                     }
                 }
             }
-        } else {
-            l.clone()
         }
-    };
-    let analysis = MonotoneFramework {
-        direction,
-        initial_value,
-        transfer,
-    };
-    analysis.run(&cfg)
+    }
+
+    // TODO(altanh): separate transfer function for terminators?
+
+    fn transfer(&self, inst: &Instruction, _loc: Node, value: &mut ConditionalConstantLattice) {
+        let (env, reachable) = value;
+        match inst {
+            Instruction::Constant { dest, .. } | Instruction::Value { dest, .. } => {
+                let c = const_eval(env, inst);
+                env.insert(dest.clone(), c);
+            }
+            Instruction::Effect {
+                op: EffectOps::Branch,
+                labels,
+                args,
+                ..
+            } => {
+                // Look up the value of the condition; if it hasn't been defined, then we are in undefined behavior.
+                let cond = env.get(&args[0]).cloned().unwrap_or(ConstantLattice::Bot);
+                match cond {
+                    ConstantLattice::Bool(true) => {
+                        reachable.insert(self.cfg.resolve(&labels[0]));
+                    }
+                    ConstantLattice::Bool(false) => {
+                        reachable.insert(self.cfg.resolve(&labels[1]));
+                    }
+                    ConstantLattice::Top => {
+                        reachable.insert(self.cfg.resolve(&labels[0]));
+                        reachable.insert(self.cfg.resolve(&labels[1]));
+                    }
+                    ConstantLattice::Bot => {
+                        eprintln!("WARNING: undefined behavior detected at instruction: [{inst}]");
+                        // Be conservative
+                        reachable.insert(self.cfg.resolve(&labels[0]));
+                        reachable.insert(self.cfg.resolve(&labels[1]));
+                    }
+                    _ => panic!("condition is not a boolean"),
+                }
+            }
+            Instruction::Effect {
+                op: EffectOps::Jump,
+                labels,
+                ..
+            } => {
+                reachable.insert(self.cfg.resolve(&labels[0]));
+            }
+            _ => (),
+        }
+    }
 }
