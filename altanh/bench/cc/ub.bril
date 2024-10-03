@@ -1,0 +1,12 @@
+@main {
+    x: int = const 1;
+    y: bool = lt x x;
+    br y .f .t;
+.t:
+    br z .end .end;
+.f:
+    z: bool = const false;
+    jmp .t;
+.end:
+    print z;
+}

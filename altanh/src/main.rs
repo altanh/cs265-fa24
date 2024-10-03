@@ -1,4 +1,4 @@
-use altanh::cfg::ControlFlowGraph;
+use altanh::cfg::CFG;
 use bril_rs::load_program;
 
 const WRITE_CFG: bool = false;
@@ -12,7 +12,7 @@ fn main() {
     let passes: Vec<String> = std::env::args().skip(1).collect();
 
     for func in &prog.functions {
-        let cfg = ControlFlowGraph::new(func);
+        let cfg = CFG::new(func);
 
         if WRITE_CFG {
             // open file for writing using the function name
@@ -40,7 +40,7 @@ fn main() {
         }
 
         if WRITE_CFG {
-            let cfg = ControlFlowGraph::new(&func);
+            let cfg = CFG::new(&func);
             // open file for writing using the function name
             let mut file = std::fs::File::create(format!("dot/{}_opt.dot", &func.name)).unwrap();
             // write the graph to the file
