@@ -1,14 +1,10 @@
-@main(x: bool) {
-    z: int = const -1;
-    br x .t .f;
-.dead:
-    z: int = const 2;
-    jmp .end;
+@main(c: bool, y: int, z: int) {
+    br c .t .f;
 .t:
-    z: int = const 1;
+    x: int = id y;
     jmp .end;
 .f:
-    z: int = const 0;
+    x: int = id z;
 .end:
-    ret z;
+    ret x;
 }

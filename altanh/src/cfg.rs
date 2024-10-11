@@ -1,3 +1,4 @@
+use core::panic;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::Display,
@@ -17,6 +18,48 @@ pub struct Block {
 }
 
 impl Block {
+    pub fn new(insts: Vec<Instruction>, term: Option<Instruction>, label: Option<String>) -> Self {
+        let block = Block { insts, term, label };
+        block.validate();
+        block
+    }
+
+    pub fn new_flat(mut insts: Vec<Instruction>, label: Option<String>) -> Self {
+        let term = match insts.last() {
+            Some(Instruction::Effect {
+                op: EffectOps::Branch | EffectOps::Jump | EffectOps::Return,
+                ..
+            }) => Some(insts.pop().unwrap()),
+            _ => None,
+        };
+        let block = Block { insts, term, label };
+        block.validate();
+        block
+    }
+
+    pub fn validate(&self) {
+        // Check that there are no control instructions in insts
+        for inst in &self.insts {
+            match inst {
+                Instruction::Effect {
+                    op: EffectOps::Branch | EffectOps::Jump | EffectOps::Return,
+                    ..
+                } => panic!("Control instruction in insts: {} in\n{}", inst, self),
+                _ => (),
+            }
+        }
+        // Check that the terminator is a control instruction
+        if let Some(term) = &self.term {
+            match term {
+                Instruction::Effect {
+                    op: EffectOps::Branch | EffectOps::Jump | EffectOps::Return,
+                    ..
+                } => {}
+                _ => panic!("Non-control terminator: {} in\n{}", term, self),
+            }
+        }
+    }
+
     /// A block is empty iff it has no instructions, no terminator, and no label.
     pub fn is_empty(&self) -> bool {
         self.insts.is_empty() && self.term.is_none() && self.label.is_none()
@@ -86,7 +129,10 @@ impl Display for Block {
             writeln!(f, "    {inst}")?;
         }
         if let Some(term) = &self.term {
-            writeln!(f, "    [[ {term} ]]")?;
+            writeln!(f, "    # terminator")?;
+            writeln!(f, "    {term}")?;
+        } else {
+            writeln!(f, "    # fallthrough")?;
         }
         Ok(())
     }
@@ -169,10 +215,11 @@ impl<'a> CFG<'a> {
                         ..
                     } => {
                         for target in labels {
-                            let target: Node = label_map
-                                .get(target)
-                                .cloned()
-                                .map_or(Node::Exit, Node::Block);
+                            let target = if let Some(index) = label_map.get(target) {
+                                Node::Block(*index)
+                            } else {
+                                panic!("Label not found: {}", target);
+                            };
                             fb.flows(Node::Block(i), target);
                         }
                     }
@@ -234,7 +281,7 @@ impl<'a> CFG<'a> {
         if let Some(index) = self.label_map.get(label) {
             Node::Block(*index)
         } else {
-            Node::Exit
+            panic!("Label not found: {}", label);
         }
     }
 
@@ -249,26 +296,31 @@ impl<'a> CFG<'a> {
         };
 
         let node_label = |x: Node| match x {
-            Node::Entry | Node::Exit => node_id(x),
-            Node::Block(index) => self.blocks[index].to_string(),
+            Node::Block(index) => format!("# block {index}\n{}", &self.blocks[index]),
+            _ => unreachable!(),
         };
 
         writeln!(f, "digraph {{")?;
 
         for node in self.flow.keys() {
-            let label = node_label(*node);
-            // Escape the newlines in the label
-            let label = label.replace("\n", "\\l");
-            // Use rectangles for blocks, and left-align text.
-            if let Node::Block(_) = node {
-                writeln!(
-                    f,
-                    "  {} [label=\"{}\", shape=box, align=left];",
-                    node_id(*node),
-                    label
-                )?;
-            } else {
-                writeln!(f, "  {} [label=\"{}\"];", node_id(*node), label)?;
+            // Set the rank of entry to source and exit to sink
+            match node {
+                Node::Entry => {
+                    writeln!(
+                        f,
+                        "  {{ rank=source; {} [label=\"entry\"]; }}",
+                        node_id(*node)
+                    )?;
+                }
+                Node::Exit => {
+                    writeln!(f, "  {{ rank=sink; {} [label=\"exit\"]; }}", node_id(*node))?;
+                }
+                _ => {
+                    let label = node_label(*node);
+                    // Escape the newlines in the label
+                    let label = label.replace("\n", "\\l");
+                    writeln!(f, "  {} [label=\"{}\", shape=box];", node_id(*node), label)?;
+                }
             }
         }
 

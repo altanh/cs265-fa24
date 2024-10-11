@@ -1,0 +1,28 @@
+@phi_of_f(a: int, b:int, c: bool) {
+    br c .then .else;
+.then:
+    x: int = add a b;
+    y: int = mul a b;
+    z: int = sub x y;
+    jmp .end;
+.else:
+    x: int = sub a b;
+    y: int = div a b;
+    z: int = sub x y;
+.end:
+    ret z;
+}
+
+@f_of_phi(a: int, b: int, c: bool) {
+    br c .then .else;
+.then:
+    x: int = add a b;
+    y: int = mul a b;
+    jmp .end;
+.else:
+    x: int = sub a b;
+    y: int = div a b;
+.end:
+    z: int = sub x y;
+    ret z;
+}

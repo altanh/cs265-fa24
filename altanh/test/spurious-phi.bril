@@ -1,0 +1,12 @@
+@spurious(b: bool) {
+    one: int = const 1;
+    n: int = const 1;
+.L0:
+    x: int = add n one;
+    br b .L1 .L2;
+.L1:
+    jmp .L0;
+.L2:
+    n: int = const 2;
+    jmp .L0;
+}

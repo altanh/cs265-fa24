@@ -329,6 +329,17 @@ impl MonotoneAnalysis<HashSet<String>> for ObservableVariables {
             Constant { dest, .. } => {
                 xs.remove(dest);
             }
+            // Calls may have side effects; for now, be conservative.
+            Value {
+                dest,
+                op: ValueOps::Call,
+                args,
+                ..
+            } => {
+                xs.extend(args.iter().cloned());
+                xs.remove(dest);
+            }
+            // Pure operations
             Value { dest, args, .. } => {
                 if xs.contains(dest) {
                     xs.remove(dest);

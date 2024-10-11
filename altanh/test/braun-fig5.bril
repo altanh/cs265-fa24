@@ -1,0 +1,14 @@
+@main(b: bool, c: bool) {
+    one: int = const 1;
+    x: int = const 1;
+    br b .second_loop_entry .cond;
+.cond:
+    br c .loop .end;
+.loop:
+    y: int = add x x;
+.second_loop_entry:
+    y: int = sub x one;
+    jmp .cond;
+.end:
+    ret x;
+}

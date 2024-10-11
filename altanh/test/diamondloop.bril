@@ -1,4 +1,5 @@
-@main(x: bool) {
+@main(x: bool, y: bool) {
+.start:
     br x .t .f;
 .t:
     a: int = const 1;
@@ -9,10 +10,7 @@
     b: int = const 2;
 .foo:
     c: int = add a b;
-    jmp .bar;
-.bar:
-    a: int = const 3;
-    br .x .foo .end;
+    br y .foo .end;
 .end:
     ret a;
 }

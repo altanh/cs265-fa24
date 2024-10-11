@@ -1,0 +1,19 @@
+@diamondloop2(b: bool) {
+.L0:
+    br b .L1 .L2;
+.L1:
+    x: int = const 1;
+    jmp .L5;
+.L2:
+    br b .L3 .L4;
+.L3:
+    x: int = const 2;
+    jmp .L5;
+.L4:
+    # x undefined
+    jmp .L5;
+.L5:
+    y: int = add x x;
+    br b .end .L0;
+.end:
+}

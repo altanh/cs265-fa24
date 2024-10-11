@@ -4,11 +4,13 @@ use std::{
     io,
 };
 
-use bril_rs::{Code, EffectOps, Function, Instruction, Literal, ValueOps};
+use crate::cfg::{Block, Node, CFG};
+use bril_rs::{Instruction, Literal, ValueOps};
 
 // TODO(altanh): intern
 type Var = String;
 type Location = Node;
+type InstructionLocation = (Node, usize);
 type ValueNumber = usize;
 
 type SymVar = (ValueNumber, Location);
@@ -27,7 +29,9 @@ pub enum Expr {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SymExpr {
     Const(Literal),
-    Var(SymVar),
+    Param(Var),
+    Phi(ValueNumber, Location),
+    Call(InstructionLocation),
     Op(Op, Vec<ValueNumber>),
     Bot,
 }
@@ -52,7 +56,7 @@ impl From<Var> for Expr {
 
 impl From<SymVar> for SymExpr {
     fn from(var: SymVar) -> Self {
-        SymExpr::Var(var)
+        SymExpr::Phi(var.0, var.1)
     }
 }
 
@@ -60,13 +64,21 @@ impl From<SymVar> for SymExpr {
 pub struct HashCons(HashMap<SymExpr, ValueNumber>, HashMap<ValueNumber, SymExpr>);
 
 impl HashCons {
+    pub fn param(&mut self, var: Var) -> ValueNumber {
+        self.intern(SymExpr::Param(var))
+    }
+
     /// Warning: this will always return a new value number!
-    pub fn symbolic_var(&mut self, loc: Location) -> ValueNumber {
+    pub fn phi(&mut self, loc: Location) -> ValueNumber {
         let n = self.0.len();
-        let v = SymExpr::Var((n, loc));
+        let v = SymExpr::Phi(n, loc);
         self.0.insert(v.clone(), n);
         self.1.insert(n, v);
         n
+    }
+
+    pub fn call(&mut self, loc: InstructionLocation) -> ValueNumber {
+        self.intern(SymExpr::Call(loc))
     }
 
     pub fn intern(&mut self, se: SymExpr) -> ValueNumber {
@@ -84,39 +96,49 @@ impl HashCons {
         &self.1
     }
 
-    pub fn dot<F>(&self, f: &mut F, g: &GlobalPhi) -> io::Result<()>
+    pub fn dot<F>(&self, f: &mut F, g: &GlobalValueGraph) -> io::Result<()>
     where
         F: io::Write,
     {
         writeln!(f, "digraph {{")?;
         for (se, n) in &self.0 {
             let s = match se {
-                SymExpr::Const(lit) => format!("{n} = {:?}", lit),
+                SymExpr::Const(lit) => format!("{:?}", lit),
                 // SymExpr::Var((n, loc)) => format!("{}@{:?}", n, loc),
-                SymExpr::Var((_, loc)) => format!("X{n} @ {loc:?}"),
+                SymExpr::Param(var) => format!("{var}"),
+                SymExpr::Phi(_, loc) => format!("ϕ{n} @ {loc:?}"),
+                SymExpr::Call((n, i)) => format!("call @{n:?}.{i}"),
                 SymExpr::Op(Op::Builtin(op), _) => {
-                    format!("{n} = {:?}", op)
+                    format!("{:?}", op)
                 }
                 SymExpr::Op(Op::Extern(func), _) => {
-                    format!("{n} = {}", func)
+                    format!("@{}", func)
                 }
                 SymExpr::Bot => "⊥".to_string(),
             };
             writeln!(f, "  {} [label=\"{}\"];", n, s)?;
         }
+        // Write phi edges
         for (_, phi) in &g.phis {
             for (vars, val) in phi {
-                for v in vars {
-                    writeln!(f, "  {} -> {};", val, v.1)?;
+                for (i, v) in vars.iter().enumerate() {
+                    writeln!(f, "  {} -> {} [label=\".{}\"];", val, v.1, i)?;
                 }
             }
         }
+        // Write pure dataflow edges
         for (se, n) in &self.0 {
             if let SymExpr::Op(_, args) = se {
-                for arg in args {
+                for (i, arg) in args.iter().enumerate() {
                     // Write dotted edge
-                    writeln!(f, "  {} -> {} [style=dotted];", n, arg)?;
+                    writeln!(f, "  {} -> {} [style=dotted, label=\".{}\"];", n, arg, i)?;
                 }
+            }
+        }
+        // Write call edges
+        for (call, args) in &g.call_args {
+            for (i, arg) in args.iter().enumerate() {
+                writeln!(f, "  {} -> {} [style=dotted, label=\".{}\"];", call, arg, i)?;
             }
         }
         writeln!(f, "}}")
@@ -125,240 +147,6 @@ impl HashCons {
 
 /// TODO(altanh): functional map
 pub type AStore = HashMap<Var, ValueNumber>;
-
-#[derive(Default, Clone, PartialEq, Eq)]
-pub struct Block {
-    /// Non-control instructions
-    pub insts: Vec<Instruction>,
-    /// Terminating control instruction, or None if fallthrough
-    pub term: Option<Instruction>,
-    /// Label, if present
-    pub label: Option<String>,
-}
-
-impl Block {
-    /// A block is empty iff it has no instructions, no terminator, and no label.
-    pub fn is_empty(&self) -> bool {
-        self.insts.is_empty() && self.term.is_none() && self.label.is_none()
-    }
-
-    /// A block is a stub iff it is just a label.
-    pub fn is_stub(&self) -> bool {
-        self.insts.is_empty() && self.term.is_none() && self.label.is_some()
-    }
-
-    pub fn from_function(func: &Function) -> Vec<Block> {
-        let mut blocks: Vec<Block> = vec![];
-        let mut current: Block = Default::default();
-        for code in &func.instrs {
-            match code {
-                Code::Label { label, .. } => {
-                    // Terminate current basic block (if non-empty)
-                    if !current.is_empty() {
-                        blocks.push(current);
-                        current = Default::default();
-                    }
-                    current.label = Some(label.clone());
-                }
-                Code::Instruction(inst) => match inst {
-                    Instruction::Effect {
-                        op: EffectOps::Branch | EffectOps::Jump | EffectOps::Return,
-                        ..
-                    } => {
-                        // Terminate current block
-                        current.term = Some(inst.clone());
-                        blocks.push(current);
-                        current = Default::default();
-                    }
-                    _ => {
-                        current.insts.push(inst.clone());
-                    }
-                },
-            }
-        }
-        if !current.is_empty() {
-            blocks.push(current);
-        }
-        blocks
-    }
-}
-
-impl Display for Block {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(label) = &self.label {
-            writeln!(f, "{label}:")?;
-        }
-        for inst in &self.insts {
-            writeln!(f, "    {inst}")?;
-        }
-        if let Some(term) = &self.term {
-            writeln!(f, "    [[ {term} ]]")?;
-        }
-        Ok(())
-    }
-}
-
-fn resolve_labels(blocks: &Vec<Block>) -> HashMap<String, usize> {
-    let mut res = HashMap::new();
-    for (i, block) in blocks.iter().enumerate() {
-        if let Some(label) = &block.label {
-            res.insert(label.clone(), i);
-        }
-    }
-    res
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Node {
-    Entry,
-    Exit,
-    Block(usize),
-}
-
-impl From<usize> for Node {
-    fn from(value: usize) -> Self {
-        Node::Block(value)
-    }
-}
-
-struct FlowBuilder {
-    flow: HashMap<Node, HashSet<Node>>,
-    flow_r: HashMap<Node, HashSet<Node>>,
-}
-
-pub struct CFG<'a> {
-    pub flow: HashMap<Node, HashSet<Node>>,
-    pub flow_r: HashMap<Node, HashSet<Node>>,
-    pub func: &'a Function,
-    pub label_map: HashMap<String, usize>,
-    pub blocks: Vec<Block>,
-}
-
-impl FlowBuilder {
-    pub fn flows<S, T>(&mut self, from: S, to: T)
-    where
-        S: Into<Node>,
-        T: Into<Node>,
-    {
-        let from: Node = from.into();
-        let to: Node = to.into();
-        if let None = self.flow.get(&from) {
-            self.flow.insert(from, HashSet::new());
-            self.flow_r.insert(from, HashSet::new());
-        }
-        if let None = self.flow.get(&to) {
-            self.flow.insert(to, HashSet::new());
-            self.flow_r.insert(to, HashSet::new());
-        }
-        self.flow.get_mut(&from).unwrap().insert(to);
-        self.flow_r.get_mut(&to).unwrap().insert(from);
-    }
-}
-
-impl<'a> CFG<'a> {
-    pub fn new(func: &'a Function) -> Self {
-        let blocks = Block::from_function(func);
-        let label_map = resolve_labels(&blocks);
-        let mut fb = FlowBuilder {
-            flow: HashMap::new(),
-            flow_r: HashMap::new(),
-        };
-
-        fb.flows(Node::Entry, Node::Block(0));
-
-        for (i, block) in blocks.iter().enumerate() {
-            if let Some(term) = &block.term {
-                match term {
-                    Instruction::Effect {
-                        labels,
-                        op: EffectOps::Jump | EffectOps::Branch,
-                        ..
-                    } => {
-                        for target in labels {
-                            let target: Node = label_map
-                                .get(target)
-                                .cloned()
-                                .map_or(Node::Exit, Node::Block);
-                            fb.flows(Node::Block(i), target);
-                        }
-                    }
-                    Instruction::Effect {
-                        op: EffectOps::Return,
-                        ..
-                    } => fb.flows(Node::Block(i), Node::Exit),
-                    _ => {
-                        let next_block = if i + 1 == blocks.len() {
-                            Node::Exit
-                        } else {
-                            Node::Block(i + 1)
-                        };
-                        fb.flows(Node::Block(i), next_block);
-                    }
-                }
-            } else {
-                let next_block = if i + 1 == blocks.len() {
-                    Node::Exit
-                } else {
-                    Node::Block(i + 1)
-                };
-                fb.flows(Node::Block(i), next_block);
-            }
-        }
-
-        CFG {
-            flow: fb.flow,
-            flow_r: fb.flow_r,
-            func,
-            label_map,
-            blocks,
-        }
-    }
-
-    pub fn dot<F>(&self, f: &mut F) -> io::Result<()>
-    where
-        F: io::Write,
-    {
-        let node_id = |x: Node| match x {
-            Node::Entry => "entry".to_string(),
-            Node::Exit => "exit".to_string(),
-            Node::Block(index) => index.to_string(),
-        };
-
-        let node_label = |x: Node| match x {
-            Node::Entry | Node::Exit => node_id(x),
-            Node::Block(index) => self.blocks[index].to_string(),
-        };
-
-        writeln!(f, "digraph {{")?;
-
-        for node in self.flow.keys() {
-            let label = node_label(*node);
-            // Escape the newlines in the label
-            let label = label.replace("\n", "\\l");
-            // Use rectangles for blocks, and left-align text.
-            if let Node::Block(_) = node {
-                writeln!(
-                    f,
-                    "  {} [label=\"{}\", shape=box, align=left];",
-                    node_id(*node),
-                    label
-                )?;
-            } else {
-                writeln!(f, "  {} [label=\"{}\"];", node_id(*node), label)?;
-            }
-        }
-
-        for (src, dsts) in &self.flow {
-            for dst in dsts {
-                writeln!(f, "  {} -> {};", node_id(*src), node_id(*dst))?;
-            }
-        }
-
-        writeln!(f, "}}")
-    }
-
-    // TODO(altanh): CFG simplification by merging basic blocks
-}
 
 fn eval_symbolic(e: &Expr, ctx: &AStore, hc: &mut HashCons) -> ValueNumber {
     match e {
@@ -377,7 +165,13 @@ fn eval_symbolic(e: &Expr, ctx: &AStore, hc: &mut HashCons) -> ValueNumber {
     }
 }
 
-fn step_symbolic(i: &Instruction, ctx: &mut AStore, hc: &mut HashCons) {
+fn step_symbolic(
+    i: &Instruction,
+    iloc: InstructionLocation,
+    gvg: &mut GlobalValueGraph,
+    ctx: &mut AStore,
+    hc: &mut HashCons,
+) {
     match i {
         Instruction::Constant { dest, value, .. } => {
             ctx.insert(dest.clone(), hc.intern(value.clone().into()));
@@ -386,20 +180,33 @@ fn step_symbolic(i: &Instruction, ctx: &mut AStore, hc: &mut HashCons) {
             dest,
             op: ValueOps::Call,
             args,
-            funcs,
             ..
         } => {
-            ctx.insert(
-                dest.clone(),
-                eval_symbolic(
-                    &Expr::Op(
-                        Op::Extern(funcs[0].clone()),
-                        args.iter().map(|x| Expr::Var(x.clone())).collect(),
-                    ),
-                    &ctx,
-                    hc,
-                ),
+            // TODO(altanh): this is unsound; the function may have side
+            // effects! How best to model memory and print effects?
+            // ctx.insert(
+            //     dest.clone(),
+            //     eval_symbolic(
+            //         &Expr::Op(
+            //             Op::Extern(funcs[0].clone()),
+            //             args.iter().map(|x| Expr::Var(x.clone())).collect(),
+            //         ),
+            //         &ctx,
+            //         hc,
+            //     ),
+            // );
+            let call = gvg.calls.entry(iloc).or_insert_with(|| hc.call(iloc));
+            gvg.call_args.insert(
+                *call,
+                args.iter()
+                    .map(|x| {
+                        ctx.get(x)
+                            .cloned()
+                            .unwrap_or_else(|| hc.intern(SymExpr::Bot))
+                    })
+                    .collect(),
             );
+            ctx.insert(dest.clone(), *call);
         }
         Instruction::Value { args, dest, op, .. } => {
             ctx.insert(
@@ -422,12 +229,14 @@ type PhiArgs = Vec<(Node, ValueNumber)>;
 type Phi = HashMap<PhiArgs, ValueNumber>;
 
 #[derive(Debug, Default)]
-pub struct GlobalPhi {
+pub struct GlobalValueGraph {
     pub phis: HashMap<Node, Phi>,
-    symvars: HashMap<(Vec<Var>, Location), ValueNumber>,
+    pub phi_vars: HashMap<(Vec<Var>, Location), ValueNumber>,
+    pub calls: HashMap<InstructionLocation, ValueNumber>,
+    pub call_args: HashMap<ValueNumber, Vec<ValueNumber>>,
 }
 
-impl Display for GlobalPhi {
+impl Display for GlobalValueGraph {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for (node, phi) in &self.phis {
             writeln!(f, "{:?}:", node)?;
@@ -439,13 +248,30 @@ impl Display for GlobalPhi {
     }
 }
 
-impl GlobalPhi {
-    fn clear(&mut self, at: Node) {
-        self.phis.remove(&at);
+impl GlobalValueGraph {
+    fn clear_phis(&mut self, loc: Node) {
+        self.phis.remove(&loc);
     }
 
-    fn entry(&mut self, node: Node) -> &mut Phi {
-        self.phis.entry(node).or_insert(Default::default())
+    fn phi_entry(&mut self, loc: Node) -> &mut Phi {
+        self.phis.entry(loc).or_insert(Default::default())
+    }
+
+    // See "Simple and Efficient Construction of Static Single Assignment
+    // Form" by Braun et al. for details.
+    fn simplify_trivial(&self, phi: ValueNumber, args: &PhiArgs, hc: &mut HashCons) -> ValueNumber {
+        // If there are at 2 unique value numbers, one of which is phi, then
+        // return the other one. If all arguments are phi, return bot. Otherwise
+        // return phi.
+        let mut vals: HashSet<ValueNumber> = args.iter().map(|(_, v)| *v).collect();
+        if vals.len() == 2 && vals.contains(&phi) {
+            vals.remove(&phi);
+            vals.into_iter().next().unwrap()
+        } else if vals.len() == 1 && vals.contains(&phi) {
+            hc.intern(SymExpr::Bot)
+        } else {
+            phi
+        }
     }
 
     // TODO(altanh): according to the paper, this way of doing it is completely
@@ -458,37 +284,27 @@ impl GlobalPhi {
         store: HashMap<String, PhiArgs>,
         hc: &mut HashCons,
     ) -> AStore {
-        self.clear(loc);
+        self.clear_phis(loc);
         // Collect all variables with the same phi arguments
         let mut vars: HashMap<PhiArgs, Vec<String>> = HashMap::new();
-        for (k, args) in &store {
-            vars.entry(args.clone())
-                .or_insert_with(Vec::new)
-                .push(k.clone());
+        for (k, args) in store {
+            vars.entry(args).or_insert_with(Vec::new).push(k);
         }
         // Create symbolic variables for each set of equal variables and update
         // phi entries
         let mut result: AStore = Default::default();
         for (args, vars) in vars {
             let val = match args.len() {
-                0 => hc.intern(SymExpr::Bot),
+                0 => unreachable!(),
                 1 => args[0].1,
                 _ => {
                     let val = *self
-                        .symvars
+                        .phi_vars
                         .entry((vars.clone(), loc))
-                        .or_insert_with(|| hc.symbolic_var(loc));
-                    // TODO(altanh): is this valid?
-                    // Filter out recursive uses in the phi arguments
-                    let args: PhiArgs = args.into_iter().filter(|(_, v)| *v != val).collect();
-                    match args.len() {
-                        0 => hc.intern(SymExpr::Bot),
-                        1 => args[0].1,
-                        _ => {
-                            self.entry(loc).insert(args, val);
-                            val
-                        }
-                    }
+                        .or_insert_with(|| hc.phi(loc));
+                    let val = self.simplify_trivial(val, &args, hc);
+                    self.phi_entry(loc).insert(args, val);
+                    val
                 }
             };
             for var in vars {
@@ -512,7 +328,7 @@ impl Display for HashCons {
 fn join(
     stores: Vec<(Node, &Option<AStore>)>,
     loc: Location,
-    phis: &mut GlobalPhi,
+    gvg: &mut GlobalValueGraph,
     hc: &mut HashCons,
 ) -> Option<AStore> {
     // Filter out undefined stores
@@ -531,24 +347,29 @@ fn join(
         let mut result: HashMap<String, (PhiArgs, HashSet<ValueNumber>)> = HashMap::new();
         for (n, s) in stores {
             for (x, e) in s {
+                // Skip undefined values.
+                if *e == hc.intern(SymExpr::Bot) {
+                    continue;
+                }
                 let entry = result
                     .entry(x.clone())
                     .or_insert_with(|| (vec![], HashSet::new()));
-                // Skip undefined values. Warning: this assumes that the
-                // value number for undefined is always 0. Also skip if the
-                // value number is already present.
-                if *e == 0 || entry.1.contains(e) {
-                    continue;
-                }
                 entry.0.push((n, *e));
                 entry.1.insert(*e);
             }
         }
-        Some(phis.insert_phis(
-            loc,
-            result.into_iter().map(|(k, (v, _))| (k, v)).collect(),
-            hc,
-        ))
+        // Collapse fully duplicate entries
+        let result: HashMap<String, PhiArgs> = result
+            .into_iter()
+            .map(|(k, (args, vals))| {
+                if vals.len() == 1 {
+                    (k, vec![args[0]])
+                } else {
+                    (k, args)
+                }
+            })
+            .collect();
+        Some(gvg.insert_phis(loc, result, hc))
     }
 }
 
@@ -576,20 +397,15 @@ mod tests {
         for func in &prog.functions {
             let cfg = super::CFG::new(func);
             let mut hc: HashCons = Default::default();
-            let mut phis: GlobalPhi = Default::default();
+            let mut gvg: GlobalValueGraph = Default::default();
 
             hc.intern(SymExpr::Bot);
 
-            // Initial abstract store: every variable is mapped to its own
-            // unique value number at the entry block.
-            let vars = collect_vars(func);
+            // Initial abstract store: parameters are mapped to their symbolic
+            // values, all other variables are (implicitly) mapped to ⊥.
             let mut initial: AStore = HashMap::new();
-            for var in &vars {
-                if func.args.iter().any(|arg| arg.name == *var) {
-                    initial.insert(var.clone(), hc.symbolic_var(Node::Entry));
-                } else {
-                    initial.insert(var.clone(), hc.intern(SymExpr::Bot));
-                }
+            for arg in &func.args {
+                initial.insert(arg.name.clone(), hc.param(arg.name.clone()));
             }
 
             let mut abs: HashMap<Node, Option<AStore>> = HashMap::new();
@@ -598,41 +414,44 @@ mod tests {
             }
             abs.insert(Node::Entry, Some(initial));
 
-            // Initialize worklist with preorder traversal of the CFG
-            // let mut stack: Vec<Node> = vec![Node::Entry];
-            let mut queue: VecDeque<Node> = VecDeque::new();
-            queue.push_back(Node::Entry);
-            let mut visited: HashSet<Node> = HashSet::new();
+            // Initalize worklist with reverse postorder traversal of the CFG
             let mut worklist: VecDeque<Node> = VecDeque::new();
-            while let Some(node) = queue.pop_front() {
+            let mut visited: HashSet<Node> = HashSet::new();
+
+            fn visit(
+                node: Node,
+                cfg: &CFG,
+                worklist: &mut VecDeque<Node>,
+                visited: &mut HashSet<Node>,
+            ) {
                 if visited.contains(&node) {
-                    continue;
+                    return;
                 }
                 visited.insert(node);
-                worklist.push_back(node);
                 if let Some(succs) = cfg.flow.get(&node) {
                     for succ in succs {
-                        queue.push_back(*succ);
+                        visit(*succ, cfg, worklist, visited);
                     }
                 }
+                worklist.push_front(node);
             }
+
+            visit(Node::Entry, &cfg, &mut worklist, &mut visited);
+
             println!("worklist: {:?}", worklist);
-            // let mut worklist: Vec<Node> = cfg.flow.keys().cloned().collect();
 
             let mut iter = 0;
             while let Some(n) = worklist.pop_front() {
                 println!("iter {iter} at {n:?}: ");
                 if let Node::Block(i) = n {
-                    // assert!(cfg.flow_r[&n].len() <= 1);
-                    // let mut astore = abs[&n].clone();
                     let ps: Vec<(Node, &Option<AStore>)> =
                         cfg.flow_r[&n].iter().map(|m| (*m, &abs[m])).collect();
-                    let astore = join(ps, n, &mut phis, &mut hc);
-                    // let astore = abs[cfg.flow_r[&n].iter().next().unwrap()].clone();
+                    let astore = join(ps, n, &mut gvg, &mut hc);
                     if let Some(mut astore) = astore {
                         // Symbolically execute the block
-                        for inst in &cfg.blocks[i].insts {
-                            step_symbolic(inst, &mut astore, &mut hc);
+                        for (j, inst) in cfg.blocks[i].insts.iter().enumerate() {
+                            let iloc = (n, j);
+                            step_symbolic(inst, iloc, &mut gvg, &mut astore, &mut hc);
                         }
                         // If something changed, push successors
                         let astore = Some(astore);
@@ -646,7 +465,12 @@ mod tests {
                                         "    {}: {} -> {:?}",
                                         var,
                                         if let Some(a) = &abs[&n] {
-                                            format!("{:?}", ch[a.get(var).unwrap()])
+                                            let s = if let Some(val) = a.get(var) {
+                                                format!("{:?}", ch[val])
+                                            } else {
+                                                "⊥".to_string()
+                                            };
+                                            format!("{}", s)
                                         } else {
                                             "⊥".to_string()
                                         },
@@ -654,7 +478,7 @@ mod tests {
                                     );
                                 }
                             }
-                            abs.insert(n, astore.clone());
+                            abs.insert(n, astore);
                             for succ in &cfg.flow[&n] {
                                 worklist.push_back(*succ);
                             }
@@ -663,7 +487,7 @@ mod tests {
                         continue;
                     }
                 } else {
-                    // Always push successors for entry and exit nodes
+                    // Always push successors for entry
                     for succ in &cfg.flow[&n] {
                         worklist.push_back(*succ);
                     }
@@ -673,12 +497,9 @@ mod tests {
 
             // Print the abstract store at each block
             let ch = hc.transpose();
-            for (node, store) in &abs {
+            let print = |node: Node, store: &Option<AStore>| {
                 let node_name = match node {
-                    Node::Block(i) => cfg.blocks[*i]
-                        .label
-                        .clone()
-                        .unwrap_or_else(|| i.to_string()),
+                    Node::Block(i) => cfg.blocks[i].label.clone().unwrap_or_else(|| i.to_string()),
                     _ => format!("{:?}", node),
                 };
                 println!("{node_name}:");
@@ -689,16 +510,29 @@ mod tests {
                 } else {
                     println!("    ⊥");
                 }
+            };
+            print(Node::Entry, &abs[&Node::Entry]);
+            for i in 0..cfg.blocks.len() {
+                print(Node::Block(i), &abs[&Node::Block(i)]);
             }
+            print(Node::Exit, abs.get(&Node::Exit).unwrap_or(&None));
 
             // Print the hashcons
             println!("{}", hc);
-            // Dot
-            let mut file = std::fs::File::create(format!("dot/{}_hc.dot", func.name)).unwrap();
-            hc.dot(&mut file, &phis).unwrap();
+            {
+                // Dot
+                let mut file = std::fs::File::create(format!("dot/{}_hc.dot", func.name)).unwrap();
+                hc.dot(&mut file, &gvg).unwrap();
+            }
 
             // Print the phis
-            println!("{}", phis);
+            println!("{}", gvg);
+
+            {
+                // Write the CFG to a file
+                let mut file = std::fs::File::create(format!("dot/{}.dot", func.name)).unwrap();
+                cfg.dot(&mut file).unwrap();
+            }
         }
     }
 }
