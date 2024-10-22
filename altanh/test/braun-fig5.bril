@@ -10,5 +10,5 @@
     y: int = sub x one;
     jmp .cond;
 .end:
-    ret x;
+    ret y;
 }

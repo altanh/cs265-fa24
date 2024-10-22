@@ -497,7 +497,7 @@ fn const_eval(env: &HashMap<String, ConstantLattice>, inst: &Instruction) -> Con
 }
 
 pub struct ConditionalConstant<'a> {
-    pub cfg: &'a CFG<'a>,
+    pub cfg: &'a CFG,
 }
 
 impl<'a> MonotoneAnalysis<ConditionalConstantLattice> for ConditionalConstant<'a> {
@@ -509,7 +509,7 @@ impl<'a> MonotoneAnalysis<ConditionalConstantLattice> for ConditionalConstant<'a
         // Function parameters get top
         let initial_env = self
             .cfg
-            .func
+            .func_info
             .args
             .iter()
             .map(|arg| (arg.name.clone(), ConstantLattice::Top))

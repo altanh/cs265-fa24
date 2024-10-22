@@ -1,33 +1,24 @@
-# @indvar(n: int, m: int) {
-#     i: int = const 0;
-#     x: int = const 0;
-# .cond0:
-#     c0: bool = lt i n;
-#     br c0 .loop0 .exit0;
-# .loop0:
-#     j: int = id i;
-# .cond1:
-#     c1: bool = lt n m;
-#     br c1 .loop1 .exit1;
-# .loop1:
-#     one: int = const 1;
-#     x: int = add x i;
-#     x: int = sub x j;
-#     j: int = add j one;
-#     jmp .cond1;
-# .exit1:
-#     one: int = const 1;
-#     i: int = add i one;
-#     jmp .cond0;
-# .exit0:
-#     ret c0;
-# }
-
-@indvar_simp(n: int) {
+@main(n: int, m: int) {
     i: int = const 0;
+    x: int = const 0;
 .cond0:
     c0: bool = lt i n;
+    br c0 .loop0 .exit0;
 .loop0:
-    i: int = id n;
-    br c0 .loop0 .cond0;
+    j: int = id i;
+.cond1:
+    c1: bool = lt n m;
+    br c1 .loop1 .exit1;
+.loop1:
+    one: int = const 1;
+    x: int = add x i;
+    x: int = sub x j;
+    j: int = add j one;
+    jmp .cond1;
+.exit1:
+    one: int = const 1;
+    i: int = add i one;
+    jmp .cond0;
+.exit0:
+    ret c0;
 }

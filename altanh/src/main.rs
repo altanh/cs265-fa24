@@ -12,6 +12,7 @@ fn main() {
     let passes: Vec<String> = std::env::args().skip(1).collect();
 
     for func in &prog.functions {
+        eprintln!("Optimizing {}...", &func.name);
         let cfg = CFG::new(func);
 
         if WRITE_CFG {
@@ -25,12 +26,16 @@ fn main() {
         for pass in &passes {
             match pass.as_str() {
                 "cc" => {
-                    eprintln!("Running CC...");
+                    eprintln!("-- Running CC...");
                     func = altanh::opt::cc(&func);
                 }
                 "dce" => {
-                    eprintln!("Running DCE...");
+                    eprintln!("-- Running DCE...");
                     func = altanh::opt::dce(&func);
+                }
+                "giga" => {
+                    eprintln!("-- Running gigapass...");
+                    func = altanh::ssa::gvn_gcm_cc_dce(&func);
                 }
                 _ => {
                     eprintln!("Unknown pass: {}", pass);
