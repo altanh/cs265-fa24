@@ -27,12 +27,6 @@ where
     }
 }
 
-// #[derive(Clone)]
-// struct IntersectionSemilattice<'a, T> {
-//     universe: &'a HashSet<T>,
-//     set: HashSet<T>,
-// }
-
 impl<T> Semilattice for HashSet<T>
 where
     T: Eq + Hash + Clone,
@@ -51,36 +45,6 @@ where
         self.is_subset(other)
     }
 }
-
-// impl<'a, T> PartialEq for IntersectionSemilattice<'a, T>
-// where
-//     T: Eq + Hash,
-// {
-//     fn eq(&self, other: &Self) -> bool {
-//         self.set == other.set
-//     }
-// }
-
-// impl<'a, T> Semilattice for IntersectionSemilattice<'a, T>
-// where
-//     T: Eq + Hash + Clone,
-// {
-//     fn bot(&self) -> Self {
-//         Self {
-//             universe: self.universe,
-//             set: self.universe.clone(),
-//         }
-//     }
-//     fn join(&self, other: &Self) -> Self {
-//         Self {
-//             universe: self.universe,
-//             set: self.set.intersection(&other.set).cloned().collect(),
-//         }
-//     }
-//     fn leq(&self, other: &Self) -> bool {
-//         self.set.is_superset(&other.set)
-//     }
-// }
 
 impl<S, T> Semilattice for (S, T)
 where
@@ -365,6 +329,17 @@ impl MonotoneAnalysis<HashSet<String>> for ObservableVariables {
             Constant { dest, .. } => {
                 xs.remove(dest);
             }
+            // Calls may have side effects; for now, be conservative.
+            Value {
+                dest,
+                op: ValueOps::Call,
+                args,
+                ..
+            } => {
+                xs.extend(args.iter().cloned());
+                xs.remove(dest);
+            }
+            // Pure operations
             Value { dest, args, .. } => {
                 if xs.contains(dest) {
                     xs.remove(dest);
@@ -522,7 +497,7 @@ fn const_eval(env: &HashMap<String, ConstantLattice>, inst: &Instruction) -> Con
 }
 
 pub struct ConditionalConstant<'a> {
-    pub cfg: &'a CFG<'a>,
+    pub cfg: &'a CFG,
 }
 
 impl<'a> MonotoneAnalysis<ConditionalConstantLattice> for ConditionalConstant<'a> {
@@ -534,7 +509,7 @@ impl<'a> MonotoneAnalysis<ConditionalConstantLattice> for ConditionalConstant<'a
         // Function parameters get top
         let initial_env = self
             .cfg
-            .func
+            .func_info
             .args
             .iter()
             .map(|arg| (arg.name.clone(), ConstantLattice::Top))

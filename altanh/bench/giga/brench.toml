@@ -1,0 +1,16 @@
+benchmarks = '../../../benchmarks/core/*.bril'
+extract = 'total_dyn_inst: (\d+)'
+
+[runs.baseline]
+pipeline = ["bril2json", "brili -p {args}"]
+
+[runs.valnum-dce]
+pipeline = [
+    "bril2json",
+    "../../../tylerhou_opt/_build/install/default/bin/opt",
+    "../../target/debug/altanh dce",
+    "brili -p {args}",
+]
+
+[runs.giga]
+pipeline = ["bril2json", "../../target/debug/altanh giga", "brili -p {args}"]

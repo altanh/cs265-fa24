@@ -1,0 +1,26 @@
+@main(n: int) {
+    i: int = const 1;
+    one: int = const 1;
+    x: int = id one;
+.cond:
+    b: bool = le i n;
+    br b .loop .end;
+.loop:
+    x: int = call @foo x;
+    print x;
+    y: int = call @foo one;
+    print y;
+    z: int = call @foo one;
+    print y;
+    i: int = add i one;
+    j: int = add x one;
+    jmp .cond;
+.end:
+}
+
+@foo(x: int): int {
+    one: int = const 1;
+    x: int = add x one;
+    print x;
+    ret x;
+}

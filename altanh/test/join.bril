@@ -1,0 +1,10 @@
+@main(c: bool, y: int, z: int) {
+    br c .t .f;
+.t:
+    x: int = id y;
+    jmp .end;
+.f:
+    x: int = id z;
+.end:
+    ret x;
+}

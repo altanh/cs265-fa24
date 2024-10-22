@@ -3,7 +3,7 @@ use crate::cfg::{Block, Node, CFG};
 use crate::monotone::{
     ConditionalConstant, ConstantLattice, MonotoneAnalysis, ObservableVariables,
 };
-use bril_rs::{Code, ConstOps, EffectOps, Function, Instruction, Literal, Type};
+use bril_rs::{Code, ConstOps, EffectOps, Function, Instruction, Literal, Type, ValueOps};
 
 /// Dead code elimination.
 pub fn dce(func: &Function) -> Function {
@@ -16,6 +16,11 @@ pub fn dce(func: &Function) -> Function {
         let mut block_insts = vec![];
         // NB: reverse order
         ObservableVariables.for_each_before(block, loc, &mut value_in, |inst, xs| match inst {
+            // Don't kill (possibly effectful) calls
+            Instruction::Value {
+                op: ValueOps::Call, ..
+            } => block_insts.push(inst.clone()),
+            // Otherwise, kill if not observable
             Instruction::Constant { dest, .. } | Instruction::Value { dest, .. } => {
                 if xs.contains(dest) {
                     block_insts.push(inst.clone());
@@ -24,13 +29,7 @@ pub fn dce(func: &Function) -> Function {
             _ => block_insts.push(inst.clone()),
         });
         block_insts.reverse();
-        let term = block_insts.pop();
-        Block {
-            insts: block_insts,
-            term,
-            label: block.label.clone(),
-        }
-        .emit(&mut new_insts);
+        Block::new_flat(block_insts, block.label.clone()).emit(&mut new_insts);
     }
     if new_insts.is_empty() {
         new_insts.push(Code::Instruction(Instruction::Effect {
@@ -64,68 +63,49 @@ pub fn cc(func: &Function) -> Function {
         analysis.for_each_after(block, loc, &mut value_in, |inst, (env, _)| {
             use Instruction::*;
             match inst {
-                Value { dest, .. } => match env.get(dest) {
-                    Some(ConstantLattice::Int(z)) => {
+                Value { dest, .. } => {
+                    let maybe_const = match env.get(dest) {
+                        Some(ConstantLattice::Int(z)) => Some((Type::Int, Literal::Int(*z))),
+                        Some(ConstantLattice::Bool(b)) => Some((Type::Bool, Literal::Bool(*b))),
+                        _ => None,
+                    };
+                    if let Some((const_type, value)) = maybe_const {
                         block_insts.push(Constant {
                             dest: dest.clone(),
                             op: ConstOps::Const,
-                            const_type: Type::Int,
-                            value: Literal::Int(*z),
+                            const_type,
+                            value,
                         });
-                    }
-                    Some(ConstantLattice::Bool(b)) => {
-                        block_insts.push(Constant {
-                            dest: dest.clone(),
-                            op: ConstOps::Const,
-                            const_type: Type::Bool,
-                            value: Literal::Bool(*b),
-                        });
-                    }
-                    _ => {
+                    } else {
                         block_insts.push(inst.clone());
                     }
-                },
+                }
                 Effect {
                     args,
                     labels,
                     op: EffectOps::Branch,
                     ..
                 } => {
-                    match env.get(&args[0]) {
-                        Some(ConstantLattice::Bool(true)) => {
-                            // Jump directly to true branch
-                            block_insts.push(Effect {
-                                args: vec![],
-                                funcs: vec![],
-                                labels: vec![labels[0].clone()],
-                                op: EffectOps::Jump,
-                            });
-                        }
-                        Some(ConstantLattice::Bool(false)) => {
-                            // Jump directly to false branch
-                            block_insts.push(Effect {
-                                args: vec![],
-                                funcs: vec![],
-                                labels: vec![labels[1].clone()],
-                                op: EffectOps::Jump,
-                            });
-                        }
-                        _ => {
-                            // Do nothing
-                            block_insts.push(inst.clone());
-                        }
+                    let maybe_labels = match env.get(&args[0]) {
+                        Some(ConstantLattice::Bool(true)) => Some(vec![labels[0].clone()]),
+                        Some(ConstantLattice::Bool(false)) => Some(vec![labels[1].clone()]),
+                        _ => None,
+                    };
+                    if let Some(labels) = maybe_labels {
+                        block_insts.push(Effect {
+                            args: vec![],
+                            funcs: vec![],
+                            labels,
+                            op: EffectOps::Jump,
+                        });
+                    } else {
+                        block_insts.push(inst.clone());
                     }
                 }
                 _ => block_insts.push(inst.clone()),
             }
         });
-        let term = block_insts.pop();
-        Block {
-            insts: block_insts,
-            term,
-            label: block.label.clone(),
-        }
-        .emit(&mut new_insts);
+        Block::new_flat(block_insts, block.label.clone()).emit(&mut new_insts);
     }
     Function {
         name: func.name.clone(),

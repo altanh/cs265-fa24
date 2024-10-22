@@ -1,0 +1,11 @@
+@main(x: bool) {
+        br x .t .f;
+.t:
+        y: bool = not x;
+        jmp .end;
+.f:
+        y: bool = id x;
+        jmp .end;
+.end:
+        print y;
+}

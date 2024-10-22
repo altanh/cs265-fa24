@@ -1,0 +1,14 @@
+@loop(n: int) {
+    i: int = const 0;
+    x: int = const 1;
+    one: int = const 1;
+.c:
+    b: bool = lt i n;
+    br b .body .exit;
+.body:
+    x: int = add x i;
+    i: int = add i one;
+    jmp .c;
+.exit:
+    ret x;
+}

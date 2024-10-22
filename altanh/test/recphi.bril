@@ -1,0 +1,10 @@
+@main(b: bool) {
+    x: int = const 0;
+    one: int = const 1;
+.foo:
+    x0: int = add x one;
+    x: int = id x0;
+    br b .foo .end;
+.end:
+    ret x;
+}

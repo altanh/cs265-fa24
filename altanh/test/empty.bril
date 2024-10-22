@@ -1,0 +1,7 @@
+@main() {
+.foo:
+.bar:
+    jmp .baz;
+    bad: int = const 1;
+.baz:
+}
