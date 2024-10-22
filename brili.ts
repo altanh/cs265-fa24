@@ -316,9 +316,15 @@ type State = {
   // For profiling: a total count of the number of instructions executed.
   icount: bigint,
 
-  // For SSA (phi-node) execution: keep track of recently-seen labels.j
+  // For SSA (phi-node) execution: keep track of recently-seen labels.
   curlabel: string | null,
-  lastlabel: string | null,
+  lastblock: null | {
+    label: string,
+    // The environment at the end of the last basic block. To evaluate the RHS
+    // of phi nodes, we lookup values in this map to avoid the "swap problem"
+    // (https://github.com/sampsyo/bril/issues/330)
+    endenv: Env,
+  },
 
   // For speculation: the state at the point where speculation began.
   specparent: State | null,
@@ -363,7 +369,7 @@ function evalCall(instr: bril.Operation, state: State): Action {
     heap: state.heap,
     funcs: state.funcs,
     icount: state.icount,
-    lastlabel: null,
+    lastblock: null,
     curlabel: null,
     specparent: null,  // Speculation not allowed.
   }
@@ -681,10 +687,10 @@ function evalInstr(instr: bril.Instruction, state: State): Action {
     if (labels.length != args.length) {
       throw error(`phi node has unequal numbers of labels and args`);
     }
-    if (!state.lastlabel) {
+    if (state.lastblock === null) {
       throw error(`phi node executed with no last label`);
     }
-    let idx = labels.indexOf(state.lastlabel);
+    let idx = labels.indexOf(state.lastblock.label);
     if (idx === -1) {
       // Last label not handled. Leave uninitialized.
       state.env.delete(instr.dest);
@@ -694,7 +700,7 @@ function evalInstr(instr: bril.Instruction, state: State): Action {
         throw error(`phi node needed at least ${idx+1} arguments`);
       }
       let src = instr.args[idx];
-      let val = state.env.get(src);
+      let val = state.lastblock.endenv.get(src);
       if (val === undefined) {
         state.env.delete(instr.dest);
       } else {
@@ -811,7 +817,7 @@ function evalFunc(func: bril.Function, state: State): Value | null {
         // count "aborted" instructions.
         Object.assign(state, {
           env: state.specparent.env,
-          lastlabel: state.specparent.lastlabel,
+          lastblock: state.specparent.lastblock,
           curlabel: state.specparent.curlabel,
           specparent: state.specparent.specparent,
         });
@@ -839,8 +845,13 @@ function evalFunc(func: bril.Function, state: State): Value | null {
         }
       }
     } else if ('label' in line) {
-      // Update CFG tracking for SSA phi nodes.
-      state.lastlabel = state.curlabel;
+      if (state.curlabel !== null) {
+        // Update CFG tracking for SSA phi nodes.
+        state.lastblock = {
+          label: state.curlabel,
+          endenv: new Map(state.env),
+        };
+      }
       state.curlabel = line.label;
     }
   }
@@ -943,7 +954,7 @@ function evalProg(prog: bril.Program) {
     heap,
     env: newEnv,
     icount: BigInt(0),
-    lastlabel: null,
+    lastblock: null,
     curlabel: null,
     specparent: null,
   }
