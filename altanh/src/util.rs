@@ -1,6 +1,6 @@
 use std::{
     cmp::min,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     hash::Hash,
 };
 
@@ -54,8 +54,9 @@ pub fn collect_vars(func: &Function) -> HashSet<String> {
     res
 }
 
-pub type UFNode = u32;
+pub type UFNode = usize;
 
+#[derive(Debug, Default)]
 pub struct UnionFind {
     nodes: Vec<UFNode>,
 }
@@ -98,6 +99,15 @@ impl UnionFind {
 
     pub fn equiv(&self, x: UFNode, y: UFNode) -> bool {
         self.root(x) == self.root(y)
+    }
+
+    pub fn sets(&self) -> BTreeMap<UFNode, BTreeSet<UFNode>> {
+        let mut sets: BTreeMap<UFNode, BTreeSet<UFNode>> = Default::default();
+        for node in 0..self.nodes.len() {
+            let node = node as UFNode;
+            sets.entry(self.root(node)).or_default().insert(node);
+        }
+        sets
     }
 }
 
@@ -202,7 +212,8 @@ where
 
     // Compute SCC DAG
     let res_nodes: HashSet<V> = res.keys().cloned().collect();
-    let mut res_adj: HashMap<V, HashSet<V>> = HashMap::new();
+    let mut res_adj: HashMap<V, HashSet<V>> =
+        res.keys().map(|v| (v.clone(), HashSet::new())).collect();
     for (v, us) in adj {
         if !res_nodes.contains(v) {
             continue;
@@ -214,7 +225,6 @@ where
             res_adj.entry(v.clone()).or_default().insert(u.clone());
         }
     }
-    complete_adj(&mut res_adj);
     (res_adj, res)
 }
 

@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     cfg::dominates,
-    util::{complete_adj, op_commutative, op_type, scc, topological_order},
+    util::{complete_adj, op_commutative, op_type, scc, topological_order, UFNode, UnionFind},
 };
 use crate::{
     cfg::{Block, Guard, Node, CFG},
@@ -52,11 +52,212 @@ impl From<Var> for Expr {
     }
 }
 
+type EClassData = (Option<SymExpr>, Option<Type>);
+type EClass = UFNode;
+
+pub struct EGraph {
+    uf: UnionFind,
+    /// e-node -> e-class mapping
+    n2c: HashMap<SymExpr, EClass>,
+    data: HashMap<EClass, EClassData>,
+}
+
+impl EGraph {
+    fn new() -> Self {
+        EGraph {
+            uf: Default::default(),
+            n2c: Default::default(),
+            data: Default::default(),
+        }
+    }
+
+    fn canonicalize(&self, enode: SymExpr) -> SymExpr {
+        match enode {
+            SymExpr::Op(op, args) => {
+                let args: Vec<EClass> = args.into_iter().map(|c| self.uf.root(c)).collect();
+                SymExpr::Op(op, args)
+            }
+            _ => enode,
+        }
+    }
+
+    pub fn insert(&mut self, enode: SymExpr, ty: Option<Type>) -> EClass {
+        let enode = self.canonicalize(enode);
+        if let Some(c) = self.n2c.get(&enode) {
+            *c
+        } else {
+            let c = self.uf.make_node();
+            self.n2c.insert(enode.clone(), c);
+            self.data.insert(c, (Some(enode), ty));
+            self.simplify(c)
+        }
+    }
+
+    pub fn canonical_enode(&self, c: EClass) -> Option<SymExpr> {
+        self.data[&c].0.clone()
+    }
+
+    fn sort_key(&self, c: EClass) -> (i32, EClass) {
+        if let Some(SymExpr::Const(_)) = self.canonical_enode(c) {
+            (0, c)
+        } else {
+            (1, c)
+        }
+    }
+
+    fn is_sorted(&self, args: &Vec<EClass>) -> bool {
+        for i in 0..args.len() - 1 {
+            if self.sort_key(args[i]) > self.sort_key(args[i + 1]) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn try_const(&self, c: EClass, value: Option<Literal>) -> Option<Literal> {
+        match (self.canonical_enode(c), value) {
+            (Some(SymExpr::Const(lit)), None) => Some(lit),
+            (Some(SymExpr::Const(lit)), Some(value)) if lit == value => Some(lit),
+            _ => None,
+        }
+    }
+
+    pub fn simplify(&mut self, c: EClass) -> EClass {
+        let c = self.uf.root(c);
+        let canonical = self.canonical_enode(c);
+        if let Some(canonical) = canonical {
+            match canonical {
+                SymExpr::Op(op, mut args) if op_commutative(&op) && !self.is_sorted(&args) => {
+                    // Sort arguments so constants come first
+                    args.sort_by_cached_key(|&c| self.sort_key(c));
+                    let c_canonical = self.insert(SymExpr::Op(op, args), self.data[&c].1.clone());
+                    self.union(c, c_canonical);
+                    self.simplify(c_canonical)
+                }
+                // 0 + x => x
+                SymExpr::Op(ValueOps::Add, args)
+                    if self.try_const(args[0], Literal::Int(0).into()).is_some() =>
+                {
+                    let c_canonical = args[1];
+                    self.union(c, c_canonical);
+                    self.simplify(c_canonical)
+                }
+                // 0 * x => 0
+                SymExpr::Op(ValueOps::Mul, args)
+                    if self.try_const(args[0], Literal::Int(0).into()).is_some() =>
+                {
+                    let c_canonical = args[0];
+                    self.union(c, c_canonical);
+                    self.simplify(c_canonical)
+                }
+                // 1 * x => x
+                SymExpr::Op(ValueOps::Mul, args)
+                    if self.try_const(args[0], Literal::Int(1).into()).is_some() =>
+                {
+                    let c_canonical = args[1];
+                    self.union(c, c_canonical);
+                    self.simplify(c_canonical)
+                }
+                // x / 1 => x
+                SymExpr::Op(ValueOps::Div, args)
+                    if self.try_const(args[1], Literal::Int(1).into()).is_some() =>
+                {
+                    let c_canonical = args[0];
+                    self.union(c, c_canonical);
+                    self.simplify(c_canonical)
+                }
+                // x - x => 0
+                SymExpr::Op(ValueOps::Sub, args) if self.uf.equiv(args[0], args[1]) => {
+                    let c_canonical =
+                        self.insert(SymExpr::Const(Literal::Int(0)), Type::Int.into());
+                    self.union(c, c_canonical);
+                    self.simplify(c_canonical)
+                }
+                _ => c,
+            }
+        } else {
+            c
+        }
+    }
+
+    fn merge(&self, (old_e, old_ty): EClassData, (new_e, new_ty): EClassData) -> EClassData {
+        assert_eq!(old_ty, new_ty);
+        // let (enode, ty) = new;
+        // if let Some(enode) = enode {
+        //     (Some(self.canonicalize(enode)), ty)
+        // } else {
+        //     (enode, ty)
+        // }
+        let e = match (&old_e, &new_e) {
+            (None, None) => None,
+            (x, None) => panic!("incompatible merge {x:?} with None"),
+            (None, y) => panic!("incompatible merge {y:?} with None"),
+            (Some(SymExpr::Const(x)), Some(SymExpr::Const(y))) => {
+                assert_eq!(x, y);
+                old_e
+            }
+            (Some(SymExpr::Const(_)), _) => old_e,
+            (_, Some(SymExpr::Const(_))) => new_e,
+            // _ => panic!("incompatible merge {old_e:?} with {new_e:?}"),
+            _ => new_e,
+        };
+        (e, new_ty)
+    }
+
+    pub fn union(&mut self, x: EClass, y: EClass) -> EClass {
+        if self.uf.equiv(x, y) {
+            return x;
+        }
+        let r = self.uf.merge(x, y);
+        let x_d = self.data.remove(&x).unwrap();
+        let y_d = self.data.remove(&y).unwrap();
+        self.data.insert(r, self.merge(x_d, y_d));
+        // Repair the hashcons
+        loop {
+            let mut repairs: Vec<(SymExpr, SymExpr)> = vec![];
+            for enode in self.n2c.keys().cloned() {
+                let canonical = self.canonicalize(enode.clone());
+                if enode != canonical {
+                    repairs.push((enode, canonical));
+                }
+            }
+            if repairs.is_empty() {
+                break;
+            }
+            for (old, new) in repairs {
+                let old_c = self.n2c[&old];
+                if let Some(new_c) = self.n2c.get(&new).cloned() {
+                    if !self.uf.equiv(old_c, new_c) {
+                        let old_d = self.data.remove(&old_c).unwrap();
+                        let new_d = self.data.remove(&new_c).unwrap();
+                        let new_c = self.uf.merge(old_c, new_c);
+                        // TODO: merge
+                        self.data.insert(new_c, self.merge(old_d, new_d));
+                    }
+                } else {
+                    self.n2c.insert(new, old_c);
+                }
+                self.n2c.remove(&old);
+            }
+        }
+        r
+    }
+
+    pub fn c2n(&self) -> HashMap<EClass, Vec<&SymExpr>> {
+        let mut res: HashMap<EClass, Vec<&SymExpr>> = HashMap::new();
+        for (n, c) in &self.n2c {
+            res.entry(self.uf.root(*c)).or_default().push(n);
+        }
+        res
+    }
+}
+
 #[derive(Debug)]
 pub struct HashCons {
     e2v: HashMap<SymExpr, ValueNumber>,
     v2e: HashMap<ValueNumber, SymExpr>,
     v2t: HashMap<ValueNumber, Type>,
+    // uf: UnionFind,
 }
 
 impl Default for HashCons {
@@ -65,6 +266,7 @@ impl Default for HashCons {
             e2v: Default::default(),
             v2e: Default::default(),
             v2t: Default::default(),
+            // uf: Default::default(),
         };
         hc.intern(SymExpr::Bot, None);
         hc
@@ -237,6 +439,41 @@ impl HashCons {
         self.v2e.get(&v)
     }
 
+    fn repair(&mut self, se: SymExpr, old: ValueNumber, new: ValueNumber) -> ValueNumber {
+        let v = self.e2v[&se];
+        if v == old {
+            self.e2v.insert(se.clone(), new);
+            self.v2e.insert(old, se);
+            new
+        } else {
+            let v_new = match &se {
+                SymExpr::Op(op, args) => {
+                    let args: Vec<ValueNumber> = args
+                        .iter()
+                        .map(|v| self.repair(self.v2e[v].clone(), old, new))
+                        .collect();
+                    let se_new = SymExpr::Op(op.clone(), args);
+                    self.intern(se_new, self.v2t.get(&v).cloned())
+                }
+                _ => v,
+            };
+            if v_new != v {
+                self.e2v.insert(se.clone(), v_new);
+                self.v2e.insert(v, self.v2e[&v_new].clone());
+            }
+            v_new
+        }
+    }
+
+    pub fn subsume(&mut self, old: ValueNumber, new: ValueNumber) {
+        assert!(self.v2t[&old] == self.v2t[&new]);
+        self.v2e.insert(old, self.v2e[&new].clone());
+        let all: Vec<SymExpr> = self.e2v.keys().cloned().collect();
+        for se in all {
+            self.repair(se, old, new);
+        }
+    }
+
     pub fn dot<F>(&self, f: &mut F, g: &GlobalValueGraph) -> io::Result<()>
     where
         F: io::Write,
@@ -369,6 +606,11 @@ impl GlobalValueGraph {
         if vals.len() == 2 && vals.contains(&phi) {
             vals.remove(&phi);
             let val = vals.into_iter().next().unwrap();
+            if let SymExpr::Phi(_, _) = &hc.v2e[&val] {
+                eprintln!("__phi{phi} ~> __phi{val} = ϕ({:?})", self.phis[&val]);
+            } else {
+                eprintln!("__phi{phi} ~> __v{val} = {:?}", hc.v2e[&val]);
+            }
             val
         } else if vals.len() == 1 && vals.contains(&phi) {
             hc.bot()
@@ -402,7 +644,9 @@ impl GlobalValueGraph {
                 _ => {
                     vars.sort();
                     let val = hc.phi(vars.clone(), loc, hc.v2t[&args[0].1].clone());
+                    // let val_opt = self.simplify_trivial(val, &args, hc);
                     self.phis.insert(val, args);
+                    // val_opt
                     val
                 }
             };
@@ -684,7 +928,7 @@ fn used_values(cfg: &CFG, ssa: &SSA) -> HashMap<Node, HashSet<ValueNumber>> {
             .values()
             .cloned()
             .flatten()
-            .filter(|v| matches!(&ssa.hc.v2e[v], SymExpr::Phi(_, _)))
+            .filter(|v| ssa.gvg.phis.contains_key(v))
             .collect();
         for phi in live_phis {
             for &(pred, v) in &ssa.gvg.phis[&phi] {
@@ -1104,7 +1348,9 @@ fn lower(cfg: &CFG, ssa: &SSA) -> Vec<Block> {
     // phi_move[n][phi] = v means at n, we want a move `phi = id v`.
     let mut phi_moves: HashMap<Node, HashMap<ValueNumber, HashSet<ValueNumber>>> = HashMap::new();
     for (phi, phi_args) in &ssa.gvg.phis {
+        // assert!(live.contains(phi));
         if !live.contains(phi) {
+            eprintln!("__phi{phi} is dead, skipping...");
             continue;
         }
         for &(pred, arg_val) in phi_args {
@@ -1121,24 +1367,27 @@ fn lower(cfg: &CFG, ssa: &SSA) -> Vec<Block> {
     for (node, phi_adj) in phi_moves.iter_mut() {
         complete_adj(phi_adj);
         let block = blocks.entry(*node).or_default();
-        // Compute SCC DAG
+        // Compute SCC DAG.
         let (dag, sccs) = scc(phi_adj);
         // Linearize DAG
         let order = topological_order(&dag);
         // Process each component
         for root in order {
-            if sccs[&root].len() == 1 {
-                if let Some(arg_val) = phi_adj[&root].iter().next() {
-                    // No cycle; just emit the move
-                    block.insts.push(Instruction::Value {
-                        args: vec![v2s(arg_val)],
-                        dest: format!("__phi{root}"),
-                        funcs: vec![],
-                        labels: vec![],
-                        op: ValueOps::Id,
-                        op_type: ssa.hc.v2t[&root].clone(),
-                    });
-                }
+            if dag[&root].is_empty() {
+                // Either root is a leaf, or it was an identity move root ->
+                // root which has been collapsed into a single node. In either
+                // case, nothing to do.
+            } else if sccs[&root].len() == 1 {
+                let arg_val = phi_adj[&root].iter().next().unwrap();
+                // No cycle; just emit the move
+                block.insts.push(Instruction::Value {
+                    args: vec![v2s(arg_val)],
+                    dest: format!("__phi{root}"),
+                    funcs: vec![],
+                    labels: vec![],
+                    op: ValueOps::Id,
+                    op_type: ssa.hc.v2t[&root].clone(),
+                });
             } else {
                 // NB: since every edge x -> y is a phi move x := y, and there
                 // are never two moves for the same phi, it follows that every
@@ -1210,6 +1459,140 @@ fn diff_abs(old: &Option<AStore>, new: &Option<AStore>) {
             eprintln!("{k}: {o} -> {v}");
         }
     }
+}
+
+fn kill_phis(mut ssa: SSA) -> SSA {
+    fn kill_phis_rec(
+        phis: Vec<ValueNumber>,
+        ssa: &SSA,
+        kill: &mut HashMap<ValueNumber, ValueNumber>,
+    ) {
+        let mut phi_graph: HashMap<ValueNumber, HashSet<ValueNumber>> = Default::default();
+        for phi in phis {
+            for &(_, v) in &ssa.gvg.phis[&phi] {
+                if ssa.gvg.phis.contains_key(&v) {
+                    phi_graph.entry(v).or_default().insert(phi);
+                }
+            }
+        }
+        complete_adj(&mut phi_graph);
+        let (dag, sccs) = scc(&phi_graph);
+        eprintln!("SCCs: {:?}", sccs);
+        eprintln!("DAG: {:?}", dag);
+        let order = topological_order(&dag);
+        for root in order {
+            let scc = &sccs[&root];
+            if scc.len() == 1 {
+                // Try to kill trivial phis
+                let mut args: HashSet<ValueNumber> =
+                    ssa.gvg.phis[&root].iter().map(|(_, v)| *v).collect();
+                match args.len() {
+                    1 => unreachable!("ϕ(x,x) should never be created"),
+                    2 if args.contains(&root) => {
+                        args.remove(&root);
+                        kill.insert(root, *args.iter().next().unwrap());
+                    }
+                    _ => (),
+                }
+            } else {
+                let mut outer_ops: HashSet<ValueNumber> = Default::default();
+                let mut inner: Vec<ValueNumber> = Default::default();
+                for phi in scc {
+                    let mut is_inner = true;
+                    for (_, arg) in &ssa.gvg.phis[phi] {
+                        if !scc.contains(arg) {
+                            outer_ops.insert(*arg);
+                            is_inner = false;
+                        }
+                    }
+                    if is_inner {
+                        inner.push(*phi);
+                    }
+                }
+                match outer_ops.len() {
+                    0 => unreachable!("closed ϕ cycle, how is this possible???"),
+                    1 => {
+                        let kill_with = *outer_ops.iter().next().unwrap();
+                        let kill_with = kill.get(&kill_with).cloned().unwrap_or(kill_with);
+                        for &phi in scc {
+                            kill.insert(phi, kill_with);
+                        }
+                    }
+                    _ => {
+                        kill_phis_rec(inner, ssa, kill);
+                    }
+                }
+            }
+        }
+    }
+
+    // Kill unused phis
+    // {
+    //     let used: HashSet<ValueNumber> = used_values(&ssa.cfg, &ssa)
+    //         .values()
+    //         .flatten()
+    //         .cloned()
+    //         .collect();
+    //     let kill: Vec<ValueNumber> = ssa
+    //         .gvg
+    //         .phis
+    //         .keys()
+    //         .filter(|v| !used.contains(v))
+    //         .cloned()
+    //         .collect();
+    //     for phi in kill {
+    //         ssa.gvg.phis.remove(&phi);
+    //     }
+    // }
+
+    let mut kill: HashMap<ValueNumber, ValueNumber> = Default::default();
+    kill_phis_rec(ssa.gvg.phis.keys().cloned().collect(), &ssa, &mut kill);
+    eprintln!("kill: {kill:?}");
+    let kill_with: HashSet<ValueNumber> = kill.values().cloned().collect();
+    let killed: HashSet<ValueNumber> = kill.keys().cloned().collect();
+    eprintln!("{killed:?}");
+    eprintln!("{kill_with:?}");
+    let try_kill = |v: &mut ValueNumber| {
+        let mut kill_with: &usize = v;
+        while let Some(next) = kill.get(kill_with) {
+            kill_with = next;
+        }
+        *v = *kill_with;
+    };
+    eprintln!("{}", ssa.hc);
+    for old in kill.keys() {
+        let mut new = old;
+        while let Some(next) = kill.get(new) {
+            new = next;
+        }
+        ssa.hc.subsume(*old, *new);
+    }
+    eprintln!("{}", ssa.hc);
+    // // Remove dead phis
+    for killed in kill.keys() {
+        ssa.gvg.phis.remove(killed);
+    }
+    // Update living phi arguments
+    for args in ssa.gvg.phis.values_mut() {
+        for (_, v) in args.iter_mut() {
+            try_kill(v);
+        }
+    }
+    // Update effect arguments
+    for args in ssa.gvg.effects.values_mut() {
+        for v in args.iter_mut() {
+            try_kill(v);
+        }
+    }
+    // Update abstractions
+    for a in ssa.abs.values_mut() {
+        if let Some(a) = a {
+            for v in a.values_mut() {
+                try_kill(v);
+            }
+        }
+    }
+    ssa
 }
 
 pub fn gvn_gcm_cc_dce(func: &Function) -> Function {
@@ -1291,16 +1674,25 @@ pub fn gvn_gcm_cc_dce(func: &Function) -> Function {
         }
     }
 
+    let ssa = SSA { cfg, hc, gvg, abs };
     // Write hashcons to dot
     {
         // Make sure the directory exists
         std::fs::create_dir_all("dot").unwrap();
-        let path = format!("dot/hc_{}.dot", &func.name);
+        let path = format!("dot/hc_nokill_{}.dot", &func.name);
         let mut file = std::fs::File::create(path).unwrap();
-        hc.dot(&mut file, &gvg).unwrap();
+        ssa.hc.dot(&mut file, &ssa.gvg).unwrap();
+    }
+    let ssa = kill_phis(ssa);
+    // Write hashcons to dot
+    {
+        // Make sure the directory exists
+        std::fs::create_dir_all("dot").unwrap();
+        let path = format!("dot/hc_kill_{}.dot", &func.name);
+        let mut file = std::fs::File::create(path).unwrap();
+        ssa.hc.dot(&mut file, &ssa.gvg).unwrap();
     }
 
-    let ssa = SSA { cfg, hc, gvg, abs };
     let res = lower(&ssa.cfg, &ssa);
     let mut instrs: Vec<Code> = vec![];
     for block in res {
@@ -1316,10 +1708,7 @@ pub fn gvn_gcm_cc_dce(func: &Function) -> Function {
 
 #[cfg(test)]
 mod tests {
-    use bril_rs::{Code, Function};
-
     use super::*;
-    use std::collections::{HashMap, VecDeque};
 
     #[test]
     fn ssa_blocks() {
@@ -1334,191 +1723,97 @@ mod tests {
     }
 
     #[test]
-    fn ssa_basic() {
-        let prog = bril_rs::load_program();
-        for func in &prog.functions {
-            let cfg = super::CFG::new(func);
-            let mut hc: HashCons = Default::default();
-            let mut gvg: GlobalValueGraph = Default::default();
+    fn test_egraph_basic() {
+        let mut egraph = EGraph::new();
+        let a = egraph.insert(SymExpr::Const(Literal::Int(1)), None);
+        let b = egraph.insert(SymExpr::Phi(vec![], Node::Entry), None);
+        let c = egraph.insert(SymExpr::Const(Literal::Int(2)), None);
+        let add1 = egraph.insert(SymExpr::Op(ValueOps::Add, vec![a, b]), None);
+        let add2 = egraph.insert(SymExpr::Op(ValueOps::Add, vec![a, c]), None);
 
-            // Initial abstract store: parameters are mapped to their symbolic
-            // values, all other variables are (implicitly) mapped to ⊥.
-            let mut initial: AStore = HashMap::new();
-            for arg in &func.args {
-                initial.insert(arg.name.clone(), hc.param(arg.clone()));
+        {
+            println!("BEFORE UNION");
+            let c2n = egraph.c2n();
+            for (c, n) in c2n {
+                println!("{c}: {n:?}");
             }
-
-            let mut abs: HashMap<Node, Option<AStore>> = HashMap::new();
-            for node in cfg.flow.keys() {
-                abs.insert(*node, None);
-            }
-            abs.insert(Node::Entry, Some(initial));
-
-            // Initalize worklist with reverse postorder traversal of the CFG
-            let mut worklist: VecDeque<Node> = VecDeque::new();
-            let mut visited: HashSet<Node> = HashSet::new();
-
-            fn visit(
-                node: Node,
-                cfg: &CFG,
-                worklist: &mut VecDeque<Node>,
-                visited: &mut HashSet<Node>,
-            ) {
-                if visited.contains(&node) {
-                    return;
-                }
-                visited.insert(node);
-                if let Some(succs) = cfg.flow.get(&node) {
-                    for succ in succs {
-                        visit(*succ, cfg, worklist, visited);
-                    }
-                }
-                worklist.push_front(node);
-            }
-
-            visit(Node::Entry, &cfg, &mut worklist, &mut visited);
-
-            eprintln!("worklist: {:?}", worklist);
-
-            let mut iter = 0;
-            while let Some(n) = worklist.pop_front() {
-                eprintln!("iter {iter} at {n:?}: ");
-                if let Node::Block(i) = n {
-                    let ps: Vec<(Node, &AStore)> = cfg.flow_r[&n]
-                        .iter()
-                        .filter_map(|m| {
-                            // Filter out predecessors that are either
-                            // unreachable, or have falsified guards on the
-                            // transition m --guard-> m
-                            let a = abs[m].as_ref()?;
-                            match &cfg.guards[&(*m, n)] {
-                                Guard::IfTrue(x) => {
-                                    // If the guard variable is undefined, we
-                                    // can go sicko mode
-                                    let v = a.get(x)?;
-                                    match &hc.v2e[v] {
-                                        SymExpr::Const(Literal::Bool(false)) => None,
-                                        _ => Some((*m, a)),
-                                    }
-                                }
-                                Guard::IfFalse(x) => {
-                                    let v = a.get(x)?;
-                                    match &hc.v2e[v] {
-                                        SymExpr::Const(Literal::Bool(true)) => None,
-                                        _ => Some((*m, a)),
-                                    }
-                                }
-                                Guard::Always => Some((*m, a)),
-                            }
-                        })
-                        .collect();
-                    let astore = join(ps, n, &mut gvg, &mut hc);
-                    if let Some(mut astore) = astore {
-                        // Symbolically execute the block
-                        for (j, inst) in cfg.blocks[i].insts.iter().enumerate() {
-                            let iloc = (n, j);
-                            step_symbolic(inst, iloc, &mut gvg, &mut astore, &mut hc);
-                        }
-                        // If something changed, push successors
-                        let astore = Some(astore);
-                        if astore != abs[&n] {
-                            // Print the diff
-                            eprintln!("update at {:?}", n);
-                            if let Some(astore) = &astore {
-                                // let ch = hc.transpose();
-                                for (var, val) in astore {
-                                    eprintln!(
-                                        "    {}: {} -> {:?}",
-                                        var,
-                                        if let Some(a) = &abs[&n] {
-                                            let s = if let Some(val) = a.get(var) {
-                                                format!("{:?}", hc.rev_lookup(val).unwrap())
-                                            } else {
-                                                "⊥".to_string()
-                                            };
-                                            format!("{}", s)
-                                        } else {
-                                            "⊥".to_string()
-                                        },
-                                        hc.rev_lookup(val).unwrap()
-                                    );
-                                }
-                            }
-                            abs.insert(n, astore);
-                            for succ in &cfg.flow[&n] {
-                                worklist.push_back(*succ);
-                            }
-                        }
-                    } else {
-                        continue;
-                    }
-                } else {
-                    // Always push successors for entry
-                    for succ in &cfg.flow[&n] {
-                        worklist.push_back(*succ);
-                    }
-                }
-                iter += 1;
-            }
-
-            // Print the abstract store at each block
-            let print = |node: Node, store: &Option<AStore>| {
-                let node_name = match node {
-                    Node::Block(i) => cfg.blocks[i].label.clone().unwrap_or_else(|| i.to_string()),
-                    _ => format!("{:?}", node),
-                };
-                eprintln!("{node_name}:");
-                if let Some(store) = store {
-                    for (var, val) in store {
-                        eprintln!("    {}: {:?}", var, hc.rev_lookup(val).unwrap());
-                    }
-                } else {
-                    eprintln!("    ⊥");
-                }
-            };
-            print(Node::Entry, &abs[&Node::Entry]);
-            for i in 0..cfg.blocks.len() {
-                print(Node::Block(i), &abs[&Node::Block(i)]);
-            }
-            print(Node::Exit, abs.get(&Node::Exit).unwrap_or(&None));
-
-            // Print the hashcons
-            eprintln!("{}", hc);
-            {
-                // Dot
-                let mut file = std::fs::File::create(format!("dot/{}_hc.dot", func.name)).unwrap();
-                hc.dot(&mut file, &gvg).unwrap();
-            }
-
-            // Print the scope of symbolic values
-            let dt = cfg.dom_tree();
-            for (se, _) in &hc.e2v {
-                let sc = scope(se, &dt, &hc);
-                eprintln!("scope {se:?} = {sc:?}");
-            }
-
-            // Print the phis
-            // eprintln!("{}", gvg);
-
-            {
-                // Write the CFG to a file
-                let mut file = std::fs::File::create(format!("dot/{}.dot", func.name)).unwrap();
-                cfg.dot(&mut file).unwrap();
-            }
-
-            let ssa = SSA { cfg, hc, gvg, abs };
-            let res = lower(&ssa.cfg, &ssa);
-            let mut instrs: Vec<Code> = vec![];
-            for block in res {
-                block.emit(&mut instrs);
-            }
-            let func = Function {
-                args: func.args.clone(),
-                instrs,
-                name: func.name.clone(),
-                return_type: func.return_type.clone(),
-            };
-            println!("{func}");
+            println!("{:?}", egraph.data);
         }
+
+        egraph.union(b, c);
+
+        {
+            println!("AFTER UNION");
+            let c2n = egraph.c2n();
+            for (c, n) in c2n {
+                println!("{c}: {n:?}");
+            }
+            println!("{:?}", egraph.data);
+        }
+    }
+
+    #[test]
+    fn test_egraph_comm() {
+        let mut egraph = EGraph::new();
+        let a = egraph.insert(SymExpr::Const(Literal::Int(0)), None);
+        let b = egraph.insert(SymExpr::Const(Literal::Int(1)), None);
+        let c = egraph.insert(SymExpr::Phi(vec![], Node::Entry), None);
+        let add1 = egraph.insert(SymExpr::Op(ValueOps::Add, vec![b, a]), None);
+        let add2 = egraph.insert(SymExpr::Op(ValueOps::Add, vec![c, b]), None);
+
+        {
+            println!("BEFORE UNION");
+            let c2n = egraph.c2n();
+            for (c, n) in c2n {
+                println!("{c}: {n:?}");
+            }
+            println!("{:?}", egraph.data);
+            println!("{:?}", egraph.uf.sets());
+        }
+
+        egraph.union(b, c);
+
+        {
+            println!("AFTER UNION");
+            let c2n = egraph.c2n();
+            for (c, n) in c2n {
+                println!("{c}: {n:?}");
+            }
+            println!("{:?}", egraph.data);
+            println!("{:?}", egraph.uf.sets());
+        }
+    }
+
+    #[test]
+    fn test_egraph_arith() {
+        let mut egraph = EGraph::new();
+        let mut int =
+            |i: i64, e: &mut EGraph| e.insert(SymExpr::Const(Literal::Int(i)), Type::Int.into());
+        let mut mul = |a: EClass, b: EClass, e: &mut EGraph| {
+            e.insert(SymExpr::Op(ValueOps::Mul, vec![a, b]), Type::Int.into())
+        };
+        let mut add = |a: EClass, b: EClass, e: &mut EGraph| {
+            e.insert(SymExpr::Op(ValueOps::Add, vec![a, b]), Type::Int.into())
+        };
+        let mut sub = |a: EClass, b: EClass, e: &mut EGraph| {
+            e.insert(SymExpr::Op(ValueOps::Sub, vec![a, b]), Type::Int.into())
+        };
+        let mut div = |a: EClass, b: EClass, e: &mut EGraph| {
+            e.insert(SymExpr::Op(ValueOps::Div, vec![a, b]), Type::Int.into())
+        };
+
+        let _0 = int(0, &mut egraph);
+        let _1 = int(1, &mut egraph);
+        let _2 = int(2, &mut egraph);
+        let _0_mul = mul(_0, _2, &mut egraph);
+        let _0_sub = sub(_1, _1, &mut egraph);
+        let _2_mul = mul(_1, _2, &mut egraph);
+
+        let c2n = egraph.c2n();
+        for (c, n) in c2n {
+            println!("{c}: {n:?}");
+        }
+        println!("{:?}", egraph.data);
+        println!("{:?}", egraph.uf.sets());
     }
 }

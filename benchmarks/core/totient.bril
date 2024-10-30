@@ -21,6 +21,7 @@
   npmod: int = call @mod n p;
   if_cond: bool = eq npmod zero;
   br if_cond .if_lbl .else_lbl;
+  #jmp .if_lbl;
 .if_lbl:
 
 .while.set.cond:
