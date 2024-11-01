@@ -6,54 +6,6 @@ use std::{
 
 use bril_rs::*;
 
-/// Returns the next non-label instruction starting from index `i` inclusive.
-pub fn next_inst(mut i: usize, func: &Function) -> Option<usize> {
-    while i < func.instrs.len() {
-        match &func.instrs[i] {
-            Code::Instruction(_) => return Some(i),
-            _ => i += 1,
-        }
-    }
-    None
-}
-
-/// Resolve labels to instruction offsets. Labels are resolved to the next
-/// non-label instruction. If a label is the last instruction, it is not resolved.
-pub fn resolve_labels(func: &Function) -> HashMap<String, usize> {
-    let mut queue: Vec<String> = vec![];
-    let mut map: HashMap<String, usize> = HashMap::new();
-    for (i, code) in func.instrs.iter().enumerate() {
-        match code {
-            Code::Label { label } => queue.push(label.clone()),
-            Code::Instruction(_) => {
-                // resolve queued labels
-                while let Some(label) = queue.pop() {
-                    map.insert(label, i);
-                }
-            }
-        }
-    }
-    map
-}
-
-pub fn collect_vars(func: &Function) -> HashSet<String> {
-    let mut res: HashSet<String> = Default::default();
-    for arg in &func.args {
-        res.insert(arg.name.clone());
-    }
-    for code in &func.instrs {
-        if let Code::Instruction(inst) = code {
-            match inst {
-                Instruction::Constant { dest, .. } | Instruction::Value { dest, .. } => {
-                    res.insert(dest.clone());
-                }
-                _ => (),
-            }
-        }
-    }
-    res
-}
-
 pub type UFNode = u32;
 
 pub struct UnionFind {
@@ -101,28 +53,36 @@ impl UnionFind {
     }
 }
 
-pub fn op_type(op: &ValueOps) -> Type {
+pub fn op_type(op: &ValueOps) -> Option<Type> {
     use ValueOps::*;
     match op {
-        Add | Sub | Mul | Div => Type::Int,
-        And | Or | Not | Le | Lt | Ge | Gt | Eq => Type::Bool,
-        Call | Id => panic!("{op} doesn't have a single type"),
+        Add | Sub | Mul | Div => Some(Type::Int),
+        And | Or | Not | Le | Lt | Ge | Gt | Eq => Some(Type::Bool),
+        Call | Id | Alloc | Load | PtrAdd | Phi => None,
     }
 }
 
-pub fn op_arity(op: &ValueOps) -> usize {
+pub fn op_arity(op: &ValueOps) -> Option<usize> {
     use ValueOps::*;
     match op {
-        Not | Id => 1,
-        Add | Sub | Mul | Div | And | Or | Le | Lt | Ge | Gt | Eq => 2,
-        Call => panic!("call doesn't have static arity"),
+        Not | Id | Alloc | Load => Some(1),
+        Add | Sub | Mul | Div | And | Or | Le | Lt | Ge | Gt | Eq | PtrAdd => Some(2),
+        Call | Phi => None,
     }
 }
 
-pub fn op_commutative(op: &ValueOps) -> bool {
+pub fn is_commutative(op: &ValueOps) -> bool {
     use ValueOps::*;
     match op {
         Add | Mul | And | Or | Eq => true,
+        _ => false,
+    }
+}
+
+pub fn is_effectful(op: &ValueOps) -> bool {
+    use ValueOps::*;
+    match op {
+        Call | Load | Alloc => true,
         _ => false,
     }
 }

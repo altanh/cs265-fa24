@@ -1,0 +1,22 @@
+@licm(n: int): int {
+    i: int = const 0;
+    y: int = const 0;
+.header:
+    c: bool = lt i n;
+    br c .body .exit;
+.body:
+    v1: int = const 1;
+    v2: int = const 2;
+    x: int = add v2 n;
+    v3: int = sub x v1;
+    y: int = add y v3;
+    i: int = add i v1;
+    jmp .header;
+.exit:
+    ret y;
+}
+
+@main(n: int) {
+    x: int = call @licm n;
+    print x;
+}

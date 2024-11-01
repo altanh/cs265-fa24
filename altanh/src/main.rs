@@ -13,25 +13,27 @@ fn main() {
 
     for func in &prog.functions {
         eprintln!("Optimizing {}...", &func.name);
-        let cfg = CFG::new(func);
 
         if WRITE_CFG {
-            // open file for writing using the function name
+            let cfg = CFG::new(func);
+            // Open file for writing using the function name
             let mut file = std::fs::File::create(format!("dot/{}.dot", func.name)).unwrap();
-            // write the graph to the file
+            // Write the graph to the file
             cfg.dot(&mut file).unwrap();
         }
 
         let mut func = func.clone();
         for pass in &passes {
             match pass.as_str() {
-                "cc" => {
-                    eprintln!("-- Running CC...");
-                    func = altanh::opt::cc(&func);
+                "nop" => {
+                    eprintln!("-- Running no-op CFG roundtrip...");
+                    func = CFG::new(&func).emit();
                 }
-                "dce" => {
-                    eprintln!("-- Running DCE...");
-                    func = altanh::opt::dce(&func);
+                "rotate" => {
+                    eprintln!("-- Running loop rotation...");
+                    let mut cfg = CFG::new(&func);
+                    cfg.rotate_loops();
+                    func = cfg.emit();
                 }
                 "giga" => {
                     eprintln!("-- Running gigapass...");
@@ -46,16 +48,16 @@ fn main() {
 
         if WRITE_CFG {
             let cfg = CFG::new(&func);
-            // open file for writing using the function name
+            // Open file for writing using the function name
             let mut file = std::fs::File::create(format!("dot/{}_opt.dot", &func.name)).unwrap();
-            // write the graph to the file
+            // Write the graph to the file
             cfg.dot(&mut file).unwrap();
         }
 
         new_funcs.push(func);
     }
 
-    // print the optimized program
+    // Print the optimized program
     let new_prog = bril_rs::Program {
         functions: new_funcs,
     };

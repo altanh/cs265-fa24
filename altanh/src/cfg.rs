@@ -7,30 +7,142 @@ use std::{
 
 use bril_rs::{Argument, Code, EffectOps, Function, Instruction, Type};
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Labels {
+    pub labels: HashSet<String>,
+    pub mapping: HashMap<String, Node>,
+    counter: usize,
+}
+
+impl Labels {
+    pub fn collect(code: &Vec<Code>) -> Labels {
+        let mut labels: HashSet<String> = Default::default();
+        for c in code {
+            if let Code::Label { label } = c {
+                labels.insert(label.clone());
+            }
+        }
+        Labels {
+            labels,
+            mapping: Default::default(),
+            counter: 0,
+        }
+    }
+
+    pub fn fresh(&mut self) -> String {
+        loop {
+            let l = format!("L{}", self.counter);
+            self.counter += 1;
+            if !self.labels.contains(&l) {
+                self.labels.insert(l.clone());
+                return l;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     /// Non-control instructions
     pub insts: Vec<Instruction>,
-    /// Terminating control instruction, or None if fallthrough
-    pub term: Option<Instruction>,
+    /// Terminating control instruction
+    pub term: Instruction,
     /// Label, if present
+    pub label: String,
+}
+
+pub struct BlockBuilder {
+    pub insts: Vec<Instruction>,
     pub label: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub enum Fallthrough {
+    Next(String),
+    Exit,
+    None,
+}
+
+impl BlockBuilder {
+    pub fn new(label: Option<String>) -> Self {
+        BlockBuilder {
+            insts: vec![],
+            label,
+        }
+    }
+
+    pub fn push(&mut self, inst: Instruction) {
+        self.insts.push(inst);
+    }
+
+    pub fn complete(
+        mut self,
+        number: Option<usize>,
+        fallthrough: Fallthrough,
+        labels: &mut Labels,
+    ) -> Block {
+        let last = self.insts.last().cloned();
+        let term = match (last, fallthrough) {
+            (
+                Some(
+                    term @ Instruction::Effect {
+                        op: EffectOps::Jump | EffectOps::Branch | EffectOps::Return,
+                        ..
+                    },
+                ),
+                _,
+            ) => {
+                self.insts.pop();
+                term
+            }
+            (_, Fallthrough::Next(target)) => Instruction::Effect {
+                args: vec![],
+                funcs: vec![],
+                labels: vec![target],
+                op: EffectOps::Jump,
+            },
+            (_, Fallthrough::Exit) => Instruction::Effect {
+                args: vec![],
+                funcs: vec![],
+                labels: vec![],
+                op: EffectOps::Return,
+            },
+            _ => {
+                unreachable!()
+            }
+        };
+        let block = Block {
+            insts: self.insts,
+            term,
+            label: self.label.unwrap_or_else(|| labels.fresh()),
+        };
+        block.validate();
+        if let Some(number) = number {
+            labels
+                .mapping
+                .insert(block.label.clone(), Node::Block(number));
+        }
+        block
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.insts.is_empty() && self.label.is_none()
+    }
+}
+
 impl Block {
-    pub fn new(insts: Vec<Instruction>, term: Option<Instruction>, label: Option<String>) -> Self {
+    pub fn new(insts: Vec<Instruction>, term: Instruction, label: String) -> Self {
         let block = Block { insts, term, label };
         block.validate();
         block
     }
 
-    pub fn new_flat(mut insts: Vec<Instruction>, label: Option<String>) -> Self {
+    pub fn new_flat(mut insts: Vec<Instruction>, label: String) -> Self {
         let term = match insts.last() {
             Some(Instruction::Effect {
                 op: EffectOps::Branch | EffectOps::Jump | EffectOps::Return,
                 ..
-            }) => Some(insts.pop().unwrap()),
-            _ => None,
+            }) => insts.pop().unwrap(),
+            _ => panic!("blocks must end with a control instruction"),
         };
         let block = Block { insts, term, label };
         block.validate();
@@ -49,118 +161,95 @@ impl Block {
             }
         }
         // Check that the terminator is a control instruction
-        if let Some(term) = &self.term {
-            match term {
-                Instruction::Effect {
-                    op: EffectOps::Branch | EffectOps::Jump | EffectOps::Return,
-                    ..
-                } => {}
-                _ => panic!("Non-control terminator: {} in\n{}", term, self),
-            }
+        match &self.term {
+            Instruction::Effect {
+                op: EffectOps::Branch | EffectOps::Jump | EffectOps::Return,
+                ..
+            } => {}
+            _ => panic!("Non-control terminator: {} in\n{}", &self.term, self),
         }
     }
 
-    /// A block is empty iff it has no instructions, no terminator, and no label.
-    pub fn is_empty(&self) -> bool {
-        self.insts.is_empty() && self.term.is_none() && self.label.is_none()
-    }
-
-    /// A block is a stub iff it is just a label.
-    pub fn is_stub(&self) -> bool {
-        self.insts.is_empty() && self.term.is_none() && self.label.is_some()
-    }
-
-    pub fn from_function(func: &Function) -> Vec<Block> {
+    pub fn from_function(func: &Function) -> (Vec<Block>, Labels) {
+        let mut labels: Labels = Labels::collect(&func.instrs);
         let mut blocks: Vec<Block> = vec![];
-        let mut current: Block = Default::default();
+        let mut bb: BlockBuilder = BlockBuilder::new(None);
         for code in &func.instrs {
             match code {
                 Code::Label { label, .. } => {
-                    // Terminate current basic block (if non-empty)
-                    if !current.is_empty() {
-                        blocks.push(current);
-                        current = Default::default();
+                    if !bb.is_empty() {
+                        blocks.push(bb.complete(
+                            blocks.len().into(),
+                            Fallthrough::Next(label.clone()),
+                            &mut labels,
+                        ));
                     }
-                    current.label = Some(label.clone());
+                    bb = BlockBuilder::new(Some(label.clone()));
                 }
                 Code::Instruction(inst) => match inst {
                     Instruction::Effect {
                         op: EffectOps::Branch,
-                        labels,
+                        labels: ls,
                         ..
-                    } if labels[0] == labels[1] => {
+                    } if ls[0] == ls[1] => {
                         // Normalize br x L L => jmp L
-                        current.term = Some(Instruction::Effect {
+                        bb.push(Instruction::Effect {
                             args: vec![],
                             funcs: vec![],
-                            labels: vec![labels[0].clone()],
+                            labels: vec![ls[0].clone()],
                             op: EffectOps::Jump,
                         });
-                        blocks.push(current);
-                        current = Default::default();
+                        blocks.push(bb.complete(
+                            blocks.len().into(),
+                            Fallthrough::None,
+                            &mut labels,
+                        ));
+                        bb = BlockBuilder::new(None);
                     }
                     Instruction::Effect {
                         op: EffectOps::Branch | EffectOps::Jump | EffectOps::Return,
                         ..
                     } => {
-                        // Terminate current block
-                        current.term = Some(inst.clone());
-                        blocks.push(current);
-                        current = Default::default();
+                        bb.push(inst.clone());
+                        blocks.push(bb.complete(
+                            blocks.len().into(),
+                            Fallthrough::None,
+                            &mut labels,
+                        ));
+                        bb = BlockBuilder::new(None);
                     }
                     _ => {
-                        current.insts.push(inst.clone());
+                        bb.push(inst.clone());
                     }
                 },
             }
         }
-        if !current.is_empty() {
-            blocks.push(current);
+        if !bb.is_empty() {
+            blocks.push(bb.complete(blocks.len().into(), Fallthrough::Exit, &mut labels));
         }
-        blocks
+        (blocks, labels)
     }
 
     pub fn emit(&self, out: &mut Vec<Code>) {
-        if let Some(label) = &self.label {
-            out.push(Code::Label {
-                label: label.clone(),
-            });
-        }
+        out.push(Code::Label {
+            label: self.label.clone(),
+        });
         for inst in &self.insts {
             out.push(Code::Instruction(inst.clone()));
         }
-        if let Some(term) = &self.term {
-            out.push(Code::Instruction(term.clone()));
-        }
+        out.push(Code::Instruction(self.term.clone()));
     }
 }
 
 impl Display for Block {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(label) = &self.label {
-            writeln!(f, "{label}:")?;
-        }
+        writeln!(f, ".{}:", self.label)?;
         for inst in &self.insts {
             writeln!(f, "    {inst}")?;
         }
-        if let Some(term) = &self.term {
-            writeln!(f, "    # terminator")?;
-            writeln!(f, "    {term}")?;
-        } else {
-            writeln!(f, "    # fallthrough")?;
-        }
+        writeln!(f, "    {}", self.term)?;
         Ok(())
     }
-}
-
-fn resolve_labels(blocks: &Vec<Block>) -> HashMap<String, usize> {
-    let mut res = HashMap::new();
-    for (i, block) in blocks.iter().enumerate() {
-        if let Some(label) = &block.label {
-            res.insert(label.clone(), i);
-        }
-    }
-    res
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -189,6 +278,16 @@ struct FlowBuilder<'a> {
     guards: &'a mut HashMap<(Node, Node), Guard>,
 }
 
+impl<'a> FlowBuilder<'a> {
+    fn with(cfg: &'a mut CFG) -> Self {
+        FlowBuilder {
+            flow: &mut cfg.flow,
+            flow_r: &mut cfg.flow_r,
+            guards: &mut cfg.guards,
+        }
+    }
+}
+
 pub struct FunctionInfo {
     pub args: Vec<Argument>,
     pub name: String,
@@ -210,9 +309,8 @@ pub struct CFG {
     pub flow_r: HashMap<Node, HashSet<Node>>,
     pub guards: HashMap<(Node, Node), Guard>,
     pub func_info: FunctionInfo,
-    pub label_map: HashMap<String, usize>,
+    pub labels: Labels,
     pub blocks: Vec<Block>,
-    label_counter: usize,
 }
 
 impl<'a> FlowBuilder<'a> {
@@ -255,8 +353,7 @@ impl<'a> FlowBuilder<'a> {
 
 impl CFG {
     pub fn new(func: &Function) -> Self {
-        let blocks = Block::from_function(func);
-        let label_map = resolve_labels(&blocks);
+        let (blocks, labels) = Block::from_function(func);
         let mut flow = HashMap::new();
         let mut flow_r = HashMap::new();
         let mut guards = HashMap::new();
@@ -270,50 +367,41 @@ impl CFG {
 
         for (i, block) in blocks.iter().enumerate() {
             let this_node = Node::Block(i);
-            if let Some(term) = &block.term {
-                match term {
-                    Instruction::Effect {
-                        labels,
-                        args,
-                        op: EffectOps::Branch,
-                        ..
-                    } => {
-                        let cond = args[0].clone();
-                        let then_node = label_map
-                            .get(&labels[0])
-                            .map(|j| Node::Block(*j))
-                            .expect(format!("Label not found: {}", &labels[0]).as_str());
-                        let else_node = label_map
-                            .get(&labels[1])
-                            .map(|j| Node::Block(*j))
-                            .expect(format!("Label not found: {}", &labels[1]).as_str());
-                        fb.flows(this_node, then_node, Guard::IfTrue(cond.clone()));
-                        fb.flows(this_node, else_node, Guard::IfFalse(cond));
-                    }
-                    Instruction::Effect {
-                        labels,
-                        op: EffectOps::Jump,
-                        ..
-                    } => {
-                        let target_node = label_map
-                            .get(&labels[0])
-                            .map(|j| Node::Block(*j))
-                            .expect(format!("Label not found: {}", &labels[0]).as_str());
-                        fb.flows(this_node, target_node, Guard::Always);
-                    }
-                    Instruction::Effect {
-                        op: EffectOps::Return,
-                        ..
-                    } => fb.flows(this_node, Node::Exit, Guard::Always),
-                    _ => unreachable!(),
+            match &block.term {
+                Instruction::Effect {
+                    labels: ls,
+                    args,
+                    op: EffectOps::Branch,
+                    ..
+                } => {
+                    let cond = args[0].clone();
+                    let then_node = labels
+                        .mapping
+                        .get(&ls[0])
+                        .expect(format!("Label not found: {}", &ls[0]).as_str());
+                    let else_node = labels
+                        .mapping
+                        .get(&ls[1])
+                        .expect(format!("Label not found: {}", &ls[1]).as_str());
+                    fb.flows(this_node, *then_node, Guard::IfTrue(cond.clone()));
+                    fb.flows(this_node, *else_node, Guard::IfFalse(cond));
                 }
-            } else {
-                let next_node = if i + 1 == blocks.len() {
-                    Node::Exit
-                } else {
-                    Node::Block(i + 1)
-                };
-                fb.flows(this_node, next_node, Guard::Always);
+                Instruction::Effect {
+                    labels: ls,
+                    op: EffectOps::Jump,
+                    ..
+                } => {
+                    let target_node = labels
+                        .mapping
+                        .get(&ls[0])
+                        .expect(format!("Label not found: {}", &ls[0]).as_str());
+                    fb.flows(this_node, *target_node, Guard::Always);
+                }
+                Instruction::Effect {
+                    op: EffectOps::Return,
+                    ..
+                } => fb.flows(this_node, Node::Exit, Guard::Always),
+                _ => unreachable!(),
             }
         }
 
@@ -322,17 +410,16 @@ impl CFG {
             flow_r,
             guards,
             func_info: FunctionInfo::new(func),
-            label_map,
+            labels,
             blocks,
-            label_counter: 0,
         };
         res.split_critical_edges();
         res
     }
 
     pub fn resolve(&self, label: &str) -> Node {
-        if let Some(index) = self.label_map.get(label) {
-            Node::Block(*index)
+        if let Some(node) = self.labels.mapping.get(label) {
+            *node
         } else {
             panic!("Label not found: {}", label);
         }
@@ -550,36 +637,59 @@ pub fn dominates(a: Node, mut b: Node, dom_tree: &HashMap<Node, Node>) -> bool {
 }
 
 impl CFG {
-    fn fresh_label(&mut self) -> String {
-        loop {
-            let label = format!("L{}", self.label_counter);
-            self.label_counter += 1;
-            if !self.label_map.contains_key(&label) {
-                return label;
-            }
-        }
+    fn insert_block(&mut self) -> Node {
+        let number = self.blocks.len();
+        self.blocks.push(BlockBuilder::new(None).complete(
+            number.into(),
+            Fallthrough::Exit,
+            &mut self.labels,
+        ));
+        let block = Node::Block(number);
+        let mut fb = FlowBuilder::with(self);
+        fb.flows(block, Node::Exit, Guard::Always);
+        block
     }
 
-    fn insert_block(&mut self) -> Node {
-        // Insert a new block at the end, and patch the previous end in case it
-        // fell through to exit
-        if let Some(block) = self.blocks.last_mut() {
-            if let None = block.term {
-                block.term = Some(Instruction::Effect {
-                    args: vec![],
-                    funcs: vec![],
-                    labels: vec![],
-                    op: EffectOps::Return,
-                });
-            }
+    fn update_term(&mut self, node: Node, term: Instruction) {
+        let transitions = match &term {
+            Instruction::Effect {
+                op: EffectOps::Return,
+                ..
+            } => vec![(Node::Exit, Guard::Always)],
+            Instruction::Effect {
+                op: EffectOps::Jump,
+                labels,
+                ..
+            } => vec![(self.resolve(labels[0].as_str()), Guard::Always)],
+            Instruction::Effect {
+                op: EffectOps::Branch,
+                args,
+                labels,
+                ..
+            } => vec![
+                (
+                    self.resolve(labels[0].as_str()),
+                    Guard::IfTrue(args[0].clone()),
+                ),
+                (
+                    self.resolve(labels[1].as_str()),
+                    Guard::IfFalse(args[0].clone()),
+                ),
+            ],
+            _ => panic!("invalid terminator: {}", term),
+        };
+        // Remove existing transitions
+        for s in self.flow[&node].clone() {
+            let mut fb = FlowBuilder::with(self);
+            fb.unflows(node, s);
         }
-        let label = self.fresh_label();
-        self.blocks.push(Block {
-            insts: vec![],
-            term: None,
-            label: Some(label),
-        });
-        Node::Block(self.blocks.len() - 1)
+        // Insert new transitions
+        for (s, g) in transitions {
+            let mut fb = FlowBuilder::with(self);
+            fb.flows(node, s, g);
+        }
+        // Update term
+        self.get_mut(node).unwrap().term = term;
     }
 
     /// Split the edge (from -> to) by inserting an empty basic block between
@@ -589,65 +699,63 @@ impl CFG {
         assert!(!matches!(from, Node::Entry | Node::Exit));
         assert!(!matches!(to, Node::Entry | Node::Exit));
         let new = self.insert_block();
-        let new_label = self._get(new).label.clone().unwrap();
-        // First, ensure that `to` has a label
-        if let None = self._get(to).label {
-            self._get(to).label = Some(self.fresh_label());
-        }
-        let to_label = self._get(to).label.clone().unwrap();
+        let to_label = self._get(to).label.clone();
         // Jump from the new block to `to`
-        self._get(new).term = Some(Instruction::Effect {
-            args: vec![],
-            funcs: vec![],
-            labels: vec![to_label.clone()],
-            op: EffectOps::Jump,
-        });
+        self.update_term(
+            new,
+            Instruction::Effect {
+                args: vec![],
+                funcs: vec![],
+                labels: vec![to_label.clone()],
+                op: EffectOps::Jump,
+            },
+        );
         // Fix `from` terminator. There are 3 cases:
         // 1. `from` falls through to `to`; insert a jump terminator for `from`
         //    and point it to the label of the new intermediate
         // 2. `from` jumps to `to`; replace the label
         // 3. `from` branches to `to`; replace the label for `to` in the branch
-        match self._get(from).term.clone() {
-            None
-            | Some(Instruction::Effect {
+        let new_label = self.get(new).unwrap().label.clone();
+        match self.get(from).unwrap().term.clone() {
+            Instruction::Effect {
                 op: EffectOps::Jump,
                 ..
-            }) => {
-                self._get(from).term = Some(Instruction::Effect {
-                    args: vec![],
-                    funcs: vec![],
-                    labels: vec![new_label],
-                    op: EffectOps::Jump,
-                });
+            } => {
+                self.update_term(
+                    from,
+                    Instruction::Effect {
+                        args: vec![],
+                        funcs: vec![],
+                        labels: vec![new_label],
+                        op: EffectOps::Jump,
+                    },
+                );
             }
-            Some(Instruction::Effect {
+            Instruction::Effect {
                 args,
                 funcs,
                 labels,
                 op: EffectOps::Branch,
-            }) => {
+            } => {
                 let labels: Vec<String> = labels
                     .into_iter()
                     .map(|l| if l == to_label { new_label.clone() } else { l })
                     .collect();
-                self._get(from).term = Some(Instruction::Effect {
-                    args,
-                    funcs,
-                    labels,
-                    op: EffectOps::Branch,
-                });
+                self.update_term(
+                    from,
+                    Instruction::Effect {
+                        args,
+                        funcs,
+                        labels,
+                        op: EffectOps::Branch,
+                    },
+                );
             }
-            _ => unreachable!(),
+            x => {
+                dbg!(x);
+                unreachable!();
+            }
         }
-        // Fix the flow graph
-        let mut fb = FlowBuilder {
-            flow: &mut self.flow,
-            flow_r: &mut self.flow_r,
-            guards: &mut self.guards,
-        };
-        fb.flows(from, new, fb.guards[&(from, to)].clone());
-        fb.flows(new, to, Guard::Always);
-        fb.unflows(from, to);
         new
     }
 
@@ -673,6 +781,142 @@ impl CFG {
         Function {
             args: self.func_info.args.clone(),
             instrs,
+            name: self.func_info.name.clone(),
+            return_type: self.func_info.return_type.clone(),
+        }
+    }
+}
+
+/// Header -> Nodes in loop
+pub type NaturalLoops = HashMap<(Node, Node), HashSet<Node>>;
+
+impl CFG {
+    pub fn natural_loops(&self) -> NaturalLoops {
+        let dom_tree = self.dom_tree();
+        // Identify back edges src -> dst s.t. dst dominates src
+        let mut backedges: Vec<(Node, Node)> = vec![];
+        for (&src, dsts) in &self.flow {
+            for &dst in dsts {
+                if dominates(dst, src, &dom_tree) {
+                    backedges.push((src, dst));
+                }
+            }
+        }
+        // Find the nodes in each natural loop
+        let mut loops: NaturalLoops = Default::default();
+        for (tail, header) in backedges {
+            // The nodes in the loop defined by (tail, header) are the predecessors
+            // of tail that are also dominated by header
+            let nodes = loops.entry((tail, header)).or_default();
+            nodes.insert(header);
+            let mut queue: VecDeque<Node> = Default::default();
+            queue.push_back(tail);
+            while let Some(node) = queue.pop_front() {
+                if nodes.contains(&node) || !dominates(header, node, &dom_tree) {
+                    continue;
+                }
+                nodes.insert(node);
+                for &p in &self.flow_r[&node] {
+                    queue.push_back(p);
+                }
+            }
+        }
+        loops
+    }
+
+    /// while C { B } => if C { do { B } while C }
+    pub fn rotate_loops(&mut self) {
+        // We only consider loops with headers that have one edge entering the
+        // loop body and one edge exiting.
+        let loops: Vec<((Node, Node), HashSet<Node>)> = self
+            .natural_loops()
+            .into_iter()
+            .filter(|((_, header), nodes)| {
+                if self.flow[&header].len() == 2 {
+                    let mut out = self.flow[&header].iter().cloned();
+                    let x = out.next().unwrap();
+                    let y = out.next().unwrap();
+                    match (nodes.contains(&x), nodes.contains(&y)) {
+                        (true, false) | (false, true) => true,
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
+            })
+            .collect();
+        for ((_, header), nodes) in loops {
+            // 1. Duplicate header node
+            let header_block = self.get(header).unwrap().clone();
+            let header_copy = self.insert_block();
+            self.get_mut(header_copy).unwrap().insts = header_block.insts;
+            self.update_term(header_copy, header_block.term);
+            // 2. Update non-loop predecessors of the original header to point
+            //    to the new header.
+            let old_label = header_block.label;
+            let new_label = self.get(header_copy).unwrap().label.clone();
+            for p in self.flow_r[&header].clone() {
+                if nodes.contains(&p) {
+                    continue;
+                }
+                if p == Node::Entry {
+                    // Just directly update the entry flow
+                    let mut fb = FlowBuilder::with(self);
+                    fb.unflows(p, header);
+                    fb.flows(p, header_copy, Guard::Always);
+                } else {
+                    let new_term = match &self.get(p).unwrap().term {
+                        Instruction::Effect {
+                            op: EffectOps::Jump,
+                            ..
+                        } => Instruction::Effect {
+                            args: vec![],
+                            funcs: vec![],
+                            labels: vec![new_label.clone()],
+                            op: EffectOps::Jump,
+                        },
+                        Instruction::Effect {
+                            op: EffectOps::Branch,
+                            args,
+                            labels,
+                            ..
+                        } => {
+                            let labels: Vec<String> = labels
+                                .iter()
+                                .map(|l| {
+                                    if *l == old_label {
+                                        new_label.clone()
+                                    } else {
+                                        l.clone()
+                                    }
+                                })
+                                .collect();
+                            Instruction::Effect {
+                                args: args.clone(),
+                                funcs: vec![],
+                                labels,
+                                op: EffectOps::Branch,
+                            }
+                        }
+                        _ => unreachable!(),
+                    };
+                    self.update_term(p, new_term);
+                }
+            }
+        }
+        self.split_critical_edges();
+    }
+}
+
+impl CFG {
+    pub fn emit(&self) -> Function {
+        let mut code: Vec<Code> = vec![];
+        for block in &self.blocks {
+            block.emit(&mut code);
+        }
+        Function {
+            args: self.func_info.args.clone(),
+            instrs: code,
             name: self.func_info.name.clone(),
             return_type: self.func_info.return_type.clone(),
         }

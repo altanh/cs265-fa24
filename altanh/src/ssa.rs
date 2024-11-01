@@ -6,8 +6,8 @@ use std::{
 };
 
 use crate::{
-    cfg::dominates,
-    util::{complete_adj, op_commutative, op_type, scc, topological_order},
+    cfg::{dominates, BlockBuilder, Fallthrough},
+    util::{complete_adj, is_commutative, is_effectful, op_type, scc, topological_order},
 };
 use crate::{
     cfg::{Block, Guard, Node, CFG},
@@ -38,18 +38,6 @@ pub enum SymExpr {
     Effect(InstructionLocation),
     Op(ValueOps, Vec<ValueNumber>),
     Bot,
-}
-
-impl From<Literal> for SymExpr {
-    fn from(lit: Literal) -> Self {
-        SymExpr::Const(lit)
-    }
-}
-
-impl From<Var> for Expr {
-    fn from(var: Var) -> Self {
-        Expr::Var(var)
-    }
 }
 
 #[derive(Debug)]
@@ -98,7 +86,7 @@ impl HashCons {
     // otherwise ordered by value number.
     pub fn canonicalize(&mut self, se: &SymExpr) -> Option<SymExpr> {
         match se {
-            SymExpr::Op(op, args) if op_commutative(op) => {
+            SymExpr::Op(op, args) if is_commutative(op) => {
                 let mut args: Vec<(usize, usize)> = args
                     .iter()
                     .map(|v| match &self.v2e[&v] {
@@ -120,8 +108,8 @@ impl HashCons {
         use ValueOps::*;
         match se {
             SymExpr::Op(op, args) => {
-                let op_type = op_type(op);
-                let op_arity = op_arity(op);
+                let op_type = op_type(op)?;
+                let op_arity = op_arity(op)?;
                 match (op_type, op_arity) {
                     (Type::Int, _) => {
                         let x = &self.v2e[&args[0]];
@@ -257,7 +245,7 @@ impl HashCons {
                 }
                 SymExpr::Bot => "⊥".to_string(),
             };
-            writeln!(f, "  {} [label=\"{}\"];", n, s)?;
+            writeln!(f, "  {} [label=\"{}: {}\"];", n, n, s)?;
         }
         // Write phi edges
         for (phi, args) in &g.phis {
@@ -286,6 +274,7 @@ impl HashCons {
 pub type AStore = HashMap<Var, ValueNumber>;
 
 fn eval_symbolic(op: ValueOps, args: Vec<ValueNumber>, ty: Type, hc: &mut HashCons) -> ValueNumber {
+    assert!(!is_effectful(&op));
     match op {
         ValueOps::Id => args[0],
         _ => hc.intern(SymExpr::Op(op, args), Some(ty)),
@@ -303,13 +292,14 @@ fn step_symbolic(
         Instruction::Constant { dest, value, .. } => {
             ctx.insert(dest.clone(), hc.constant(value.clone()));
         }
+        // Effectful operations
         Instruction::Value {
             dest,
-            op: ValueOps::Call,
+            op,
             args,
             op_type,
             ..
-        } => {
+        } if is_effectful(op) => {
             let args: Vec<ValueNumber> = args
                 .iter()
                 .map(|x| ctx.get(x).cloned().unwrap_or_else(|| hc.bot()))
@@ -318,6 +308,15 @@ fn step_symbolic(
             gvg.effects.insert(iloc, args);
             ctx.insert(dest.clone(), call);
         }
+        Instruction::Effect { args, .. } => {
+            let args: Vec<ValueNumber> = args
+                .iter()
+                .map(|x| ctx.get(x).cloned().unwrap_or_else(|| hc.bot()))
+                .collect();
+            let _effect = hc.effect(iloc, None);
+            gvg.effects.insert(iloc, args);
+        }
+        // Pure operations
         Instruction::Value {
             args,
             dest,
@@ -334,15 +333,6 @@ fn step_symbolic(
                 eval_symbolic(op.clone(), args, op_type.clone(), hc),
             );
         }
-        Instruction::Effect { args, .. } => {
-            let args: Vec<ValueNumber> = args
-                .iter()
-                .map(|x| ctx.get(x).cloned().unwrap_or_else(|| hc.bot()))
-                .collect();
-            let _effect = hc.effect(iloc, None);
-            gvg.effects.insert(iloc, args);
-        }
-        _ => (),
     }
 }
 
@@ -361,21 +351,21 @@ impl GlobalValueGraph {
     // -------------------------------------------------------------------------
     // See "Simple and Efficient Construction of Static Single Assignment
     // Form" by Braun et al. for details.
-    fn simplify_trivial(&self, phi: ValueNumber, args: &PhiArgs, hc: &mut HashCons) -> ValueNumber {
-        // If there are 2 unique value numbers, one of which is phi, then
-        // return the other one. If all arguments are phi, return bot. Otherwise
-        // return phi.
-        let mut vals: HashSet<ValueNumber> = args.iter().map(|(_, v)| *v).collect();
-        if vals.len() == 2 && vals.contains(&phi) {
-            vals.remove(&phi);
-            let val = vals.into_iter().next().unwrap();
-            val
-        } else if vals.len() == 1 && vals.contains(&phi) {
-            hc.bot()
-        } else {
-            phi
-        }
-    }
+    // fn simplify_trivial(&self, phi: ValueNumber, args: &PhiArgs, hc: &mut HashCons) -> ValueNumber {
+    //     // If there are 2 unique value numbers, one of which is phi, then
+    //     // return the other one. If all arguments are phi, return bot. Otherwise
+    //     // return phi.
+    //     let mut vals: HashSet<ValueNumber> = args.iter().map(|(_, v)| *v).collect();
+    //     if vals.len() == 2 && vals.contains(&phi) {
+    //         vals.remove(&phi);
+    //         let val = vals.into_iter().next().unwrap();
+    //         val
+    //     } else if vals.len() == 1 && vals.contains(&phi) {
+    //         hc.bot()
+    //     } else {
+    //         phi
+    //     }
+    // }
 
     // TODO(altanh): according to the paper, this way of doing it is completely
     // unnecessary; it should be achievable without tracking the set of
@@ -663,16 +653,13 @@ fn used_values(cfg: &CFG, ssa: &SSA) -> HashMap<Node, HashSet<ValueNumber>> {
         }
         let node_abs = ssa.abs[&node].as_ref().unwrap();
         match &block.term {
-            Some(term) => match term {
-                Instruction::Effect { args, .. } => {
-                    for &arg in args.iter().map(|x| node_abs.get(x).unwrap()) {
-                        entry.insert(arg);
-                        entry.extend(tc.get(arg, ssa));
-                    }
+            Instruction::Effect { args, .. } => {
+                for &arg in args.iter().map(|x| node_abs.get(x).unwrap()) {
+                    entry.insert(arg);
+                    entry.extend(tc.get(arg, ssa));
                 }
-                _ => unreachable!(),
-            },
-            _ => (),
+            }
+            _ => unreachable!(),
         }
     }
     // Transitive closure of phi dependencies...
@@ -687,6 +674,10 @@ fn used_values(cfg: &CFG, ssa: &SSA) -> HashMap<Node, HashSet<ValueNumber>> {
             .filter(|v| matches!(&ssa.hc.v2e[v], SymExpr::Phi(_, _)))
             .collect();
         for phi in live_phis {
+            let SymExpr::Phi(_, loc) = &ssa.hc.v2e[&phi] else {
+                unreachable!()
+            };
+            gen.entry(*loc).or_default().insert(phi);
             for &(pred, v) in &ssa.gvg.phis[&phi] {
                 let entry = gen.entry(pred).or_default();
                 changed |= entry.insert(v);
@@ -818,8 +809,8 @@ fn earliest(
             let diff: HashSet<ValueNumber> = v
                 .difference(a)
                 .cloned()
-                .filter(|&v| {
-                    let vn = scopes.get(v, dom_tree, hc);
+                .filter(|v| {
+                    let vn = scopes.get(*v, dom_tree, hc);
                     dominates(vn, node, dom_tree)
                 })
                 .collect();
@@ -867,6 +858,7 @@ where
     result
 }
 
+#[allow(dead_code)]
 fn print_map<V>(len: usize, map: &HashMap<Node, HashSet<V>>)
 where
     V: Debug,
@@ -886,45 +878,73 @@ where
     }
 }
 
-fn lower(cfg: &CFG, ssa: &SSA) -> Vec<Block> {
-    type Blocks = HashMap<Node, Block>;
-
-    // eprintln!("{}", ssa.hc);
-
-    fn v2s_impl(v: &ValueNumber, hc: &HashCons) -> String {
-        match &hc.v2e[v] {
+impl SSA {
+    pub fn v2s(&self, v: &ValueNumber) -> String {
+        match &self.hc.v2e[v] {
             SymExpr::Bot => "__undefined".to_string(),
             SymExpr::Phi(_, _) => format!("__phi{v}"),
             SymExpr::Param(p) => p.name.clone(),
             _ => format!("__v{v}"),
         }
     }
+}
 
-    let v2s = |v: &ValueNumber| v2s_impl(v, &ssa.hc);
-
+fn lower(ssa: &mut SSA, destruct_phis: bool) -> Vec<Block> {
+    type Blocks = HashMap<Node, Block>;
+    // eprintln!("{}", ssa.hc);
     fn lower_node(
         node: Node,
-        cfg: &CFG,
-        ssa: &SSA,
+        ssa: &mut SSA,
         to_compute: &HashSet<ValueNumber>,
+        destruct_phis: bool,
         blocks: &mut Blocks,
     ) {
-        let v2s = |v: &ValueNumber| v2s_impl(v, &ssa.hc);
         // Don't lower unreachable blocks
         if !ssa.is_reachable(&node) {
             eprintln!("{node:?} is dead, skipping lowering...");
             return;
         }
         let node_abs = ssa.abs[&node].as_ref().unwrap();
-        let pond = pond_of_nodes(node, to_compute, cfg, ssa);
+        let pond = pond_of_nodes(node, to_compute, &ssa.cfg, ssa);
         let order = topological_order(&pond);
         // Lower values in order
-        let mut insts: Vec<Instruction> = vec![];
-        for v in order {
-            let dest = v2s(&v);
+        let mut bb = BlockBuilder::new(ssa.cfg.get(node).map(|b| b.label.clone()));
+        if !destruct_phis {
+            // Emit phi instructions
+            for phi in order.iter().filter(|v| ssa.gvg.phis.contains_key(v)) {
+                let SymExpr::Phi(_, loc) = &ssa.hc.v2e[phi] else {
+                    unreachable!()
+                };
+                if *loc != node {
+                    continue;
+                }
+                let (labels, args): (Vec<String>, Vec<String>) = ssa.gvg.phis[phi]
+                    .iter()
+                    .map(|(n, v)| {
+                        (
+                            ssa.cfg.get(*n).map_or_else(
+                                || blocks[&Node::Entry].label.clone(),
+                                |b| b.label.clone(),
+                            ),
+                            ssa.v2s(v),
+                        )
+                    })
+                    .unzip();
+                bb.push(Instruction::Value {
+                    args,
+                    dest: ssa.v2s(phi),
+                    funcs: vec![],
+                    labels,
+                    op: ValueOps::Phi,
+                    op_type: ssa.hc.v2t[phi].clone(),
+                });
+            }
+        }
+        for v in order.into_iter().filter(|v| !ssa.gvg.phis.contains_key(v)) {
+            let dest = ssa.v2s(&v);
             match &ssa.hc.v2e[&v] {
                 SymExpr::Const(c) => {
-                    insts.push(Instruction::Constant {
+                    bb.push(Instruction::Constant {
                         dest,
                         op: ConstOps::Const,
                         const_type: c.get_type(),
@@ -932,29 +952,27 @@ fn lower(cfg: &CFG, ssa: &SSA) -> Vec<Block> {
                     });
                 }
                 SymExpr::Op(op, args) => {
-                    let args: Vec<String> = args.iter().map(v2s).collect();
-                    insts.push(Instruction::Value {
+                    let args: Vec<String> = args.iter().map(|v| ssa.v2s(v)).collect();
+                    bb.push(Instruction::Value {
                         args: args,
                         dest,
                         funcs: vec![],
                         labels: vec![],
                         op: op.clone(),
-                        op_type: op_type(op),
+                        op_type: ssa.hc.v2t[&v].clone(),
                     });
                 }
                 SymExpr::Effect(iloc) => {
-                    let args: Vec<String> = ssa.gvg.effects[iloc].iter().map(v2s).collect();
+                    let args: Vec<String> =
+                        ssa.gvg.effects[iloc].iter().map(|v| ssa.v2s(v)).collect();
                     // Fetch original instruction
-                    let orig = &cfg.get(iloc.0).unwrap().insts[iloc.1];
+                    let orig = &ssa.cfg.get(iloc.0).unwrap().insts[iloc.1];
                     match orig {
                         Instruction::Value {
-                            op: ValueOps::Call,
-                            funcs,
-                            op_type,
-                            ..
+                            op, funcs, op_type, ..
                         } => {
-                            insts.push(Instruction::Value {
-                                op: ValueOps::Call,
+                            bb.push(Instruction::Value {
+                                op: op.clone(),
                                 args,
                                 dest,
                                 funcs: funcs.clone(),
@@ -962,12 +980,8 @@ fn lower(cfg: &CFG, ssa: &SSA) -> Vec<Block> {
                                 op_type: op_type.clone(),
                             });
                         }
-                        Instruction::Effect {
-                            funcs,
-                            op: op @ (EffectOps::Call | EffectOps::Print),
-                            ..
-                        } => {
-                            insts.push(Instruction::Effect {
+                        Instruction::Effect { funcs, op, .. } => {
+                            bb.push(Instruction::Effect {
                                 args,
                                 funcs: funcs.clone(),
                                 labels: vec![],
@@ -980,7 +994,8 @@ fn lower(cfg: &CFG, ssa: &SSA) -> Vec<Block> {
                 SymExpr::Phi(_, _) => {
                     // We don't do anything here. Rather, once everything else
                     // is lowered, we go over all phi definitions and insert
-                    // moves as needed.
+                    // moves as needed (if destructing).
+                    unreachable!()
                 }
                 SymExpr::Param(_) => {}
                 SymExpr::Bot => (),
@@ -988,72 +1003,81 @@ fn lower(cfg: &CFG, ssa: &SSA) -> Vec<Block> {
         }
         match node {
             Node::Entry => {
-                blocks.insert(node, Block::new_flat(insts, None));
+                // Get unique target of entry
+                let next = ssa.cfg.flow[&Node::Entry].iter().next().cloned().unwrap();
+                let next_label = ssa.cfg.get(next).unwrap().label.clone();
+                blocks.insert(
+                    node,
+                    bb.complete(None, Fallthrough::Next(next_label), &mut ssa.cfg.labels),
+                );
             }
             Node::Block(_) => {
-                let orig = cfg.get(node).unwrap();
-                let term = if let Some(term) = &orig.term {
-                    match term {
-                        Instruction::Effect {
-                            args,
-                            labels,
-                            op: EffectOps::Branch,
-                            ..
-                        } => {
-                            // br true then else => jmp then
-                            // br false then else => jmp else
-                            let cond = node_abs[&args[0]];
-                            match &ssa.hc.v2e[&cond] {
-                                SymExpr::Const(Literal::Bool(true)) => Some(Instruction::Effect {
-                                    args: vec![],
-                                    funcs: vec![],
-                                    labels: vec![labels[0].clone()],
-                                    op: EffectOps::Jump,
-                                }),
-                                SymExpr::Const(Literal::Bool(false)) => Some(Instruction::Effect {
-                                    args: vec![],
-                                    funcs: vec![],
-                                    labels: vec![labels[1].clone()],
-                                    op: EffectOps::Jump,
-                                }),
-                                _ => Some(Instruction::Effect {
-                                    args: vec![v2s(&cond)],
-                                    funcs: vec![],
-                                    labels: labels.clone(),
-                                    op: EffectOps::Branch,
-                                }),
-                            }
-                        }
-                        Instruction::Effect {
-                            args,
-                            funcs,
-                            labels,
-                            op,
-                        } => {
-                            let args: Vec<String> =
-                                args.iter().map(|x| node_abs[x]).map(|v| v2s(&v)).collect();
-                            Some(Instruction::Effect {
-                                args,
-                                funcs: funcs.clone(),
+                let term = ssa.cfg.get(node).unwrap().term.clone();
+                let term = match &term {
+                    Instruction::Effect {
+                        args,
+                        labels,
+                        op: EffectOps::Branch,
+                        ..
+                    } => {
+                        // br true then else => jmp then
+                        // br false then else => jmp else
+                        let cond = node_abs[&args[0]];
+                        match &ssa.hc.v2e[&cond] {
+                            SymExpr::Const(Literal::Bool(true)) => Instruction::Effect {
+                                args: vec![],
+                                funcs: vec![],
+                                labels: vec![labels[0].clone()],
+                                op: EffectOps::Jump,
+                            },
+                            SymExpr::Const(Literal::Bool(false)) => Instruction::Effect {
+                                args: vec![],
+                                funcs: vec![],
+                                labels: vec![labels[1].clone()],
+                                op: EffectOps::Jump,
+                            },
+                            _ => Instruction::Effect {
+                                args: vec![ssa.v2s(&cond)],
+                                funcs: vec![],
                                 labels: labels.clone(),
-                                op: op.clone(),
-                            })
+                                op: EffectOps::Branch,
+                            },
                         }
-                        _ => unreachable!(),
                     }
-                } else {
-                    None
+                    Instruction::Effect {
+                        args,
+                        funcs,
+                        labels,
+                        op,
+                    } => {
+                        let args: Vec<String> = args
+                            .iter()
+                            .map(|x| node_abs[x])
+                            .map(|v| ssa.v2s(&v))
+                            .collect();
+                        Instruction::Effect {
+                            args,
+                            funcs: funcs.clone(),
+                            labels: labels.clone(),
+                            op: op.clone(),
+                        }
+                    }
+                    _ => unreachable!(),
                 };
-                blocks.insert(node, Block::new(insts, term, orig.label.clone()));
+                bb.push(term);
+                blocks.insert(
+                    node,
+                    bb.complete(None, Fallthrough::None, &mut ssa.cfg.labels),
+                );
             }
             _ => (),
         }
     }
 
-    let dom_tree = cfg.dom_tree();
+    let dom_tree = ssa.cfg.dom_tree();
     let mut scopes = ScopeMemo::default();
 
-    let used = used_values(cfg, ssa);
+    let used = used_values(&ssa.cfg, ssa);
     let live = {
         let mut live: HashSet<ValueNumber> = HashSet::new();
         for s in used.values() {
@@ -1061,14 +1085,14 @@ fn lower(cfg: &CFG, ssa: &SSA) -> Vec<Block> {
         }
         live
     };
-    let vb = very_busy(&used, cfg);
-    let av = available(&used, cfg, ssa);
+    let vb = very_busy(&used, &ssa.cfg);
+    let av = available(&used, &ssa.cfg, ssa);
     let pre = earliest(&av, &vb, &dom_tree, &ssa.hc, &mut scopes);
     let used_pre = merge_sets(&used, &pre);
-    let av_pre = available(&used_pre, cfg, ssa);
+    let av_pre = available(&used_pre, &ssa.cfg, ssa);
     let to_compute = diff_sets(&used_pre, &av_pre);
 
-    // let len = cfg.blocks.len();
+    // let len = ssa.cfg.blocks.len();
     // eprintln!("USED");
     // print_map(len, &used);
     // eprintln!("VB");
@@ -1090,104 +1114,106 @@ fn lower(cfg: &CFG, ssa: &SSA) -> Vec<Block> {
     // Lower all the blocks
     lower_node(
         Node::Entry,
-        cfg,
         ssa,
         &to_compute[&Node::Entry],
+        destruct_phis,
         &mut blocks,
     );
-    for i in 0..cfg.blocks.len() {
+    for i in 0..ssa.cfg.blocks.len() {
         let node = Node::Block(i);
-        // lower_node(*node, &scopes, cfg, ssa, &mut blocks);
-        lower_node(node, cfg, ssa, &to_compute[&node], &mut blocks);
+        lower_node(node, ssa, &to_compute[&node], destruct_phis, &mut blocks);
     }
 
-    // phi_move[n][phi] = v means at n, we want a move `phi = id v`.
-    let mut phi_moves: HashMap<Node, HashMap<ValueNumber, HashSet<ValueNumber>>> = HashMap::new();
-    for (phi, phi_args) in &ssa.gvg.phis {
-        if !live.contains(phi) {
-            continue;
+    if destruct_phis {
+        // phi_move[n][phi] = v means at n, we want a move `phi = id v`.
+        let mut phi_moves: HashMap<Node, HashMap<ValueNumber, HashSet<ValueNumber>>> =
+            HashMap::new();
+        for (phi, phi_args) in &ssa.gvg.phis {
+            if !live.contains(phi) {
+                continue;
+            }
+            for &(pred, arg_val) in phi_args {
+                phi_moves
+                    .entry(pred)
+                    .or_default()
+                    .entry(*phi)
+                    .or_default()
+                    .insert(arg_val);
+            }
         }
-        for &(pred, arg_val) in phi_args {
-            phi_moves
-                .entry(pred)
-                .or_default()
-                .entry(*phi)
-                .or_default()
-                .insert(arg_val);
-        }
-    }
 
-    // Lower the parallel phi moves
-    for (node, phi_adj) in phi_moves.iter_mut() {
-        complete_adj(phi_adj);
-        let block = blocks.entry(*node).or_default();
-        // Compute SCC DAG
-        let (dag, sccs) = scc(phi_adj);
-        // Linearize DAG
-        let order = topological_order(&dag);
-        // Process each component
-        for root in order {
-            if sccs[&root].len() == 1 {
-                if let Some(arg_val) = phi_adj[&root].iter().next() {
-                    // No cycle; just emit the move
+        // Lower the parallel phi moves
+        for (node, phi_adj) in phi_moves.iter_mut() {
+            complete_adj(phi_adj);
+            let block = blocks.get_mut(node).unwrap();
+            // Compute SCC DAG
+            let (dag, sccs) = scc(phi_adj);
+            // Linearize DAG
+            let order = topological_order(&dag);
+            // Process each component
+            for root in order {
+                if sccs[&root].len() == 1 {
+                    if let Some(arg_val) = phi_adj[&root].iter().next() {
+                        // No cycle; just emit the move
+                        block.insts.push(Instruction::Value {
+                            args: vec![ssa.v2s(arg_val)],
+                            dest: format!("__phi{root}"),
+                            funcs: vec![],
+                            labels: vec![],
+                            op: ValueOps::Id,
+                            op_type: ssa.hc.v2t[&root].clone(),
+                        });
+                    }
+                } else {
+                    // NB: since every edge x -> y is a phi move x := y, and there
+                    // are never two moves for the same phi, it follows that every
+                    // node has a single successor. Thus, all SCCs in this graph are
+                    // simple cycles and can be traversed by following the edges
+                    // from the root node.
+
+                    // Introduce a temporary to break the cycle
+                    let temp = format!("__temp{root}");
                     block.insts.push(Instruction::Value {
-                        args: vec![v2s(arg_val)],
-                        dest: format!("__phi{root}"),
+                        args: vec![ssa.v2s(&root)],
+                        dest: temp.clone(),
                         funcs: vec![],
                         labels: vec![],
                         op: ValueOps::Id,
                         op_type: ssa.hc.v2t[&root].clone(),
                     });
-                }
-            } else {
-                // NB: since every edge x -> y is a phi move x := y, and there
-                // are never two moves for the same phi, it follows that every
-                // node has a single successor. Thus, all SCCs in this graph are
-                // simple cycles and can be traversed by following the edges
-                // from the root node.
-
-                // Introduce a temporary to break the cycle
-                let temp = format!("__temp{root}");
-                block.insts.push(Instruction::Value {
-                    args: vec![v2s(&root)],
-                    dest: temp.clone(),
-                    funcs: vec![],
-                    labels: vec![],
-                    op: ValueOps::Id,
-                    op_type: ssa.hc.v2t[&root].clone(),
-                });
-                // Do the moves
-                let mut cur = root;
-                loop {
-                    let arg_val = phi_adj[&cur].iter().next().unwrap();
+                    // Do the moves
+                    let mut cur = root;
+                    loop {
+                        let arg_val = phi_adj[&cur].iter().next().unwrap();
+                        block.insts.push(Instruction::Value {
+                            args: vec![ssa.v2s(arg_val)],
+                            dest: format!("__phi{cur}"),
+                            funcs: vec![],
+                            labels: vec![],
+                            op: ValueOps::Id,
+                            op_type: ssa.hc.v2t[&cur].clone(),
+                        });
+                        if *arg_val == root {
+                            break;
+                        }
+                        cur = *arg_val;
+                    }
+                    // Tie the knot
                     block.insts.push(Instruction::Value {
-                        args: vec![v2s(arg_val)],
+                        args: vec![temp],
                         dest: format!("__phi{cur}"),
                         funcs: vec![],
                         labels: vec![],
                         op: ValueOps::Id,
                         op_type: ssa.hc.v2t[&cur].clone(),
                     });
-                    if *arg_val == root {
-                        break;
-                    }
-                    cur = *arg_val;
                 }
-                // Tie the knot
-                block.insts.push(Instruction::Value {
-                    args: vec![temp],
-                    dest: format!("__phi{cur}"),
-                    funcs: vec![],
-                    labels: vec![],
-                    op: ValueOps::Id,
-                    op_type: ssa.hc.v2t[&cur].clone(),
-                });
             }
         }
     }
 
     res.push(blocks.get(&Node::Entry).unwrap().clone());
-    for i in 0..cfg.blocks.len() {
+    for i in 0..ssa.cfg.blocks.len() {
         let node = Node::Block(i);
         if ssa.abs[&node].is_none() {
             continue;
@@ -1197,6 +1223,7 @@ fn lower(cfg: &CFG, ssa: &SSA) -> Vec<Block> {
     res
 }
 
+#[allow(dead_code)]
 fn diff_abs(old: &Option<AStore>, new: &Option<AStore>) {
     if let Some(new) = new {
         for (k, v) in new {
@@ -1300,8 +1327,8 @@ pub fn gvn_gcm_cc_dce(func: &Function) -> Function {
         hc.dot(&mut file, &gvg).unwrap();
     }
 
-    let ssa = SSA { cfg, hc, gvg, abs };
-    let res = lower(&ssa.cfg, &ssa);
+    let mut ssa = SSA { cfg, hc, gvg, abs };
+    let res = lower(&mut ssa, true);
     let mut instrs: Vec<Code> = vec![];
     for block in res {
         block.emit(&mut instrs);
@@ -1330,195 +1357,6 @@ mod tests {
             // Write the CFG to a file
             let mut file = std::fs::File::create(format!("dot/{}.dot", func.name)).unwrap();
             cfg.dot(&mut file).unwrap();
-        }
-    }
-
-    #[test]
-    fn ssa_basic() {
-        let prog = bril_rs::load_program();
-        for func in &prog.functions {
-            let cfg = super::CFG::new(func);
-            let mut hc: HashCons = Default::default();
-            let mut gvg: GlobalValueGraph = Default::default();
-
-            // Initial abstract store: parameters are mapped to their symbolic
-            // values, all other variables are (implicitly) mapped to ⊥.
-            let mut initial: AStore = HashMap::new();
-            for arg in &func.args {
-                initial.insert(arg.name.clone(), hc.param(arg.clone()));
-            }
-
-            let mut abs: HashMap<Node, Option<AStore>> = HashMap::new();
-            for node in cfg.flow.keys() {
-                abs.insert(*node, None);
-            }
-            abs.insert(Node::Entry, Some(initial));
-
-            // Initalize worklist with reverse postorder traversal of the CFG
-            let mut worklist: VecDeque<Node> = VecDeque::new();
-            let mut visited: HashSet<Node> = HashSet::new();
-
-            fn visit(
-                node: Node,
-                cfg: &CFG,
-                worklist: &mut VecDeque<Node>,
-                visited: &mut HashSet<Node>,
-            ) {
-                if visited.contains(&node) {
-                    return;
-                }
-                visited.insert(node);
-                if let Some(succs) = cfg.flow.get(&node) {
-                    for succ in succs {
-                        visit(*succ, cfg, worklist, visited);
-                    }
-                }
-                worklist.push_front(node);
-            }
-
-            visit(Node::Entry, &cfg, &mut worklist, &mut visited);
-
-            eprintln!("worklist: {:?}", worklist);
-
-            let mut iter = 0;
-            while let Some(n) = worklist.pop_front() {
-                eprintln!("iter {iter} at {n:?}: ");
-                if let Node::Block(i) = n {
-                    let ps: Vec<(Node, &AStore)> = cfg.flow_r[&n]
-                        .iter()
-                        .filter_map(|m| {
-                            // Filter out predecessors that are either
-                            // unreachable, or have falsified guards on the
-                            // transition m --guard-> m
-                            let a = abs[m].as_ref()?;
-                            match &cfg.guards[&(*m, n)] {
-                                Guard::IfTrue(x) => {
-                                    // If the guard variable is undefined, we
-                                    // can go sicko mode
-                                    let v = a.get(x)?;
-                                    match &hc.v2e[v] {
-                                        SymExpr::Const(Literal::Bool(false)) => None,
-                                        _ => Some((*m, a)),
-                                    }
-                                }
-                                Guard::IfFalse(x) => {
-                                    let v = a.get(x)?;
-                                    match &hc.v2e[v] {
-                                        SymExpr::Const(Literal::Bool(true)) => None,
-                                        _ => Some((*m, a)),
-                                    }
-                                }
-                                Guard::Always => Some((*m, a)),
-                            }
-                        })
-                        .collect();
-                    let astore = join(ps, n, &mut gvg, &mut hc);
-                    if let Some(mut astore) = astore {
-                        // Symbolically execute the block
-                        for (j, inst) in cfg.blocks[i].insts.iter().enumerate() {
-                            let iloc = (n, j);
-                            step_symbolic(inst, iloc, &mut gvg, &mut astore, &mut hc);
-                        }
-                        // If something changed, push successors
-                        let astore = Some(astore);
-                        if astore != abs[&n] {
-                            // Print the diff
-                            eprintln!("update at {:?}", n);
-                            if let Some(astore) = &astore {
-                                // let ch = hc.transpose();
-                                for (var, val) in astore {
-                                    eprintln!(
-                                        "    {}: {} -> {:?}",
-                                        var,
-                                        if let Some(a) = &abs[&n] {
-                                            let s = if let Some(val) = a.get(var) {
-                                                format!("{:?}", hc.rev_lookup(val).unwrap())
-                                            } else {
-                                                "⊥".to_string()
-                                            };
-                                            format!("{}", s)
-                                        } else {
-                                            "⊥".to_string()
-                                        },
-                                        hc.rev_lookup(val).unwrap()
-                                    );
-                                }
-                            }
-                            abs.insert(n, astore);
-                            for succ in &cfg.flow[&n] {
-                                worklist.push_back(*succ);
-                            }
-                        }
-                    } else {
-                        continue;
-                    }
-                } else {
-                    // Always push successors for entry
-                    for succ in &cfg.flow[&n] {
-                        worklist.push_back(*succ);
-                    }
-                }
-                iter += 1;
-            }
-
-            // Print the abstract store at each block
-            let print = |node: Node, store: &Option<AStore>| {
-                let node_name = match node {
-                    Node::Block(i) => cfg.blocks[i].label.clone().unwrap_or_else(|| i.to_string()),
-                    _ => format!("{:?}", node),
-                };
-                eprintln!("{node_name}:");
-                if let Some(store) = store {
-                    for (var, val) in store {
-                        eprintln!("    {}: {:?}", var, hc.rev_lookup(val).unwrap());
-                    }
-                } else {
-                    eprintln!("    ⊥");
-                }
-            };
-            print(Node::Entry, &abs[&Node::Entry]);
-            for i in 0..cfg.blocks.len() {
-                print(Node::Block(i), &abs[&Node::Block(i)]);
-            }
-            print(Node::Exit, abs.get(&Node::Exit).unwrap_or(&None));
-
-            // Print the hashcons
-            eprintln!("{}", hc);
-            {
-                // Dot
-                let mut file = std::fs::File::create(format!("dot/{}_hc.dot", func.name)).unwrap();
-                hc.dot(&mut file, &gvg).unwrap();
-            }
-
-            // Print the scope of symbolic values
-            let dt = cfg.dom_tree();
-            for (se, _) in &hc.e2v {
-                let sc = scope(se, &dt, &hc);
-                eprintln!("scope {se:?} = {sc:?}");
-            }
-
-            // Print the phis
-            // eprintln!("{}", gvg);
-
-            {
-                // Write the CFG to a file
-                let mut file = std::fs::File::create(format!("dot/{}.dot", func.name)).unwrap();
-                cfg.dot(&mut file).unwrap();
-            }
-
-            let ssa = SSA { cfg, hc, gvg, abs };
-            let res = lower(&ssa.cfg, &ssa);
-            let mut instrs: Vec<Code> = vec![];
-            for block in res {
-                block.emit(&mut instrs);
-            }
-            let func = Function {
-                args: func.args.clone(),
-                instrs,
-                name: func.name.clone(),
-                return_type: func.return_type.clone(),
-            };
-            println!("{func}");
         }
     }
 }

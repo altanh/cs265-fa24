@@ -4,4 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bril-rs = { version = "0.1.0", path = "../bril-rs" }
+bril-rs = { version = "0.1.0", path = "../bril-rs", features = [
+    "memory",
+    "ssa",
+] }

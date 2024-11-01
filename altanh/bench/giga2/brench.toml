@@ -1,0 +1,22 @@
+benchmarks = '../../../benchmarks/core/*.bril'
+extract = 'total_dyn_inst: (\d+)'
+
+[runs.baseline]
+pipeline = ["bril2json", "brili -p {args}"]
+
+[runs.giga]
+pipeline = ["bril2json", "../../target/debug/altanh giga", "brili -p {args}"]
+
+[runs.rotate-giga]
+pipeline = [
+    "bril2json",
+    "../../target/debug/altanh rotate giga",
+    "brili -p {args}",
+]
+
+[runs.ssa-baseline]
+pipeline = [
+    "bril2json",
+    "python ../../../examples/to_ssa.py",
+    "brili -p {args}",
+]
