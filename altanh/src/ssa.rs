@@ -23,12 +23,6 @@ type Location = Node;
 type InstructionLocation = (Node, usize);
 type ValueNumber = usize;
 
-pub enum Expr {
-    Const(Literal),
-    Var(Var),
-    Op(ValueOps, Vec<Expr>),
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SymExpr {
     Const(Literal),
@@ -563,10 +557,18 @@ fn pond_of_nodes(
         let mut maybe_last: Option<ValueNumber> = None;
         for (i, inst) in block.insts.iter().enumerate() {
             let maybe_this = match inst {
-                Instruction::Value {
-                    op: ValueOps::Call, ..
+                // Instruction::Value {
+                //     op: ValueOps::Call, ..
+                // }
+                // | Instruction::Effect { .. } => {
+                //     let e = SymExpr::Effect((node, i));
+                //     ssa.hc.lookup(&e)
+                // }
+                Instruction::Value { op, .. } if is_effectful(op) => {
+                    let e = SymExpr::Effect((node, i));
+                    ssa.hc.lookup(&e)
                 }
-                | Instruction::Effect { .. } => {
+                Instruction::Effect { .. } => {
                     let e = SymExpr::Effect((node, i));
                     ssa.hc.lookup(&e)
                 }
