@@ -8,3 +8,4 @@ bril-rs = { version = "0.1.0", path = "../bril-rs", features = [
     "memory",
     "ssa",
 ] }
+egg = "0.9.5"
