@@ -2,13 +2,17 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::{Debug, Display},
     hash::Hash,
-    io,
+    io, mem,
 };
 
 use crate::{
     cfg::{dominates, BlockBuilder, Fallthrough},
     util::{complete_adj, is_commutative, is_effectful, op_type, scc, topological_order},
-    value::{rules, translate_effectful_op, translate_pure_op, Bril, EffectWrapper, Type},
+    value::{
+        arith_rules, conditional_rules, expr_dot, mem_rules, translate_effectful_op,
+        translate_pure_op, AnalysisData, Bril, BrilAnalysis, CostFn, EGraph, EffectWrapper, ILoc,
+        Loc, PointsTo, Type,
+    },
 };
 use crate::{
     cfg::{Block, Guard, Node, CFG},
@@ -16,14 +20,10 @@ use crate::{
 };
 use bril_rs::{Argument, Code, ConstOps, EffectOps, Function, Instruction, Literal, ValueOps};
 
-use egg::{Id, RecExpr};
-
-pub type EGraph = egg::EGraph<Bril, ()>;
+use egg::{Extractor, Id, Language, RecExpr};
 
 /// TODO(altanh): functional map
 pub type AStore = HashMap<String, Id>;
-pub type Loc = Node;
-pub type ILoc = (Node, usize);
 type PhiArgs = Vec<(Node, Id)>;
 
 #[derive(Debug, Default)]
@@ -31,6 +31,15 @@ pub struct GlobalValueGraph {
     pub phis: HashMap<Id, PhiArgs>,
     pub effects: HashMap<ILoc, Id>,
 }
+
+// TODO(altanh): split state into heap and io
+// fn io_var() -> String {
+//     format!("__io")
+// }
+
+// fn heap_var() -> String {
+//     format!("__heap")
+// }
 
 fn state_var() -> String {
     format!("__state")
@@ -45,8 +54,8 @@ fn bot(eg: &EGraph) -> Id {
     eg.lookup(Bril::Bot).unwrap()
 }
 
-fn string(s: String, eg: &mut EGraph) -> Id {
-    eg.add(Bril::String(s))
+fn symbol(s: String, eg: &mut EGraph) -> Id {
+    eg.add(Bril::Symbol(s.into()))
 }
 
 fn list(vs: Vec<Id>, eg: &mut EGraph) -> Id {
@@ -74,17 +83,25 @@ fn step_symbolic(
             op,
             args,
             funcs,
+            op_type,
             ..
         } if is_effectful(op) => {
             let mut args: Vec<Id> = args
                 .iter()
                 .map(|x| ctx.get(x).cloned().unwrap_or_else(|| bot(eg)))
                 .collect();
-            // Normalize variadic arguments
+            // Normalize arguments
             match op {
+                ValueOps::Alloc => {
+                    // (size) -> (size iloc ret_ty)
+                    let iloc = eg.add(Bril::ILoc(iloc));
+                    let ty = eg.add(Bril::Type(op_type.clone().into()));
+                    args = vec![args[0], iloc, ty];
+                }
                 ValueOps::Call => {
-                    // (args...) -> (func (list args...))
-                    args = vec![string(funcs[0].clone(), eg), list(args, eg)];
+                    // (args...) -> (func (list args...) ret_ty)
+                    let ret_ty = eg.add(Bril::Type(op_type.clone().into()));
+                    args = vec![symbol(funcs[0].clone(), eg), list(args, eg), ret_ty];
                 }
                 _ => (),
             }
@@ -94,8 +111,12 @@ fn step_symbolic(
                 in_state,
                 args,
             ));
-            let value = eg.add(Bril::Fst(result));
-            let out_state = eg.add(Bril::Snd(result));
+            let (value, out_state) = if let ValueOps::Load = op {
+                // Load is special: it doesn't modify state
+                (result, in_state)
+            } else {
+                (eg.add(Bril::Fst(result)), eg.add(Bril::Snd(result)))
+            };
             gvg.effects.insert(iloc, result);
             // Update value and state
             ctx.insert(dest.clone(), value);
@@ -112,7 +133,11 @@ fn step_symbolic(
             match op {
                 EffectOps::Call => {
                     // (args...) -> (func (list args...))
-                    args = vec![string(funcs[0].clone(), eg), list(args, eg)];
+                    args = vec![
+                        symbol(funcs[0].clone(), eg),
+                        list(args, eg),
+                        eg.add(Bril::Type(Type::Unit)),
+                    ];
                 }
                 EffectOps::Print => {
                     // (args...) -> (print (list args...))
@@ -126,7 +151,13 @@ fn step_symbolic(
                 in_state,
                 args,
             ));
-            let out_state = eg.add(Bril::Snd(result));
+            // For uniformity, all calls return (T, Unit). In this case, T =
+            // Unit, but we still need to destruct the pair.
+            let out_state = if let EffectOps::Call = op {
+                eg.add(Bril::Snd(result))
+            } else {
+                result
+            };
             gvg.effects.insert(iloc, result);
             // Update state
             ctx.insert(state_var(), out_state);
@@ -190,13 +221,28 @@ impl GlobalValueGraph {
                 1 => args[0].1,
                 _ => {
                     vars.sort();
-                    let vars: Vec<Id> = vars
-                        .iter()
-                        .map(|x| eg.add(Bril::String(x.clone())))
-                        .collect();
+                    let vars: Vec<Id> = vars.iter().map(|x| symbol(x.clone(), eg)).collect();
                     let vars = list(vars, eg);
-                    let loc = eg.add(Bril::Node(loc));
-                    let phi = eg.add(Bril::Phi([vars, loc]));
+                    let loc = eg.add(Bril::ILoc(ILoc(loc, 0)));
+                    let phi_ty = eg[args[0].1].data.ty.clone().unwrap();
+                    let is_ptr = matches!(phi_ty, Type::Ptr(_));
+                    let phi_ty = eg.add(Bril::Type(phi_ty));
+                    let phi = eg.add(Bril::Phi([vars, loc, phi_ty]));
+                    // Merge points-to sets
+                    if is_ptr {
+                        let pts: Vec<_> = args
+                            .iter()
+                            .map(|(_, v)| eg[*v].data.points_to.clone().unwrap())
+                            .collect();
+                        eg.set_analysis_data(
+                            phi,
+                            AnalysisData {
+                                points_to: Some(PointsTo::join(pts)),
+                                ..eg[phi].data.clone()
+                            },
+                        );
+                    }
+                    self.phis.insert(phi, args);
                     phi
                 }
             };
@@ -305,7 +351,6 @@ pub fn compute_ssa(func: &Function) {
     // values, all other variables are (implicitly) mapped to ⊥.
     let mut initial: AStore = HashMap::new();
     for arg in &func.args {
-        // initial.insert(arg.name.clone(), hc.param(arg.clone()));
         let ty: Id = eg.add(Bril::Type(arg.arg_type.clone().into()));
         let name: Id = eg.add_expr(&arg.name.clone().parse().unwrap());
         let param: Id = eg.add(Bril::Param([name, ty]));
@@ -315,7 +360,9 @@ pub fn compute_ssa(func: &Function) {
     {
         let sv = state_var();
         let state = eg.add_expr(&sv.parse().unwrap());
-        initial.insert(sv, state);
+        let unit = eg.add(Bril::Type(Type::Unit));
+        let param = eg.add(Bril::Param([state, unit]));
+        initial.insert(sv, param);
     }
 
     let mut abs: HashMap<Node, Option<AStore>> = HashMap::new();
@@ -323,6 +370,9 @@ pub fn compute_ssa(func: &Function) {
         abs.insert(*node, None);
     }
     abs.insert(Node::Entry, Some(initial));
+
+    let mut rws = arith_rules();
+    rws.extend(mem_rules());
 
     // Initalize worklist with reverse postorder traversal of the CFG
     let mut worklist = cfg.postorder(true);
@@ -336,24 +386,25 @@ pub fn compute_ssa(func: &Function) {
                     // transition m --guard-> m
                     let a = abs[m].as_ref()?;
                     match &cfg.guards[&(*m, n)] {
-                        // Guard::IfTrue(x) => {
-                        //     // If the guard variable is undefined, we
-                        //     // can go sicko mode
-                        //     let v = a.get(x)?;
-                        //     match &hc.v2e[v] {
-                        //         SymExpr::Const(Literal::Bool(false)) => None,
-                        //         _ => Some((*m, a)),
-                        //     }
-                        // }
-                        // Guard::IfFalse(x) => {
-                        //     let v = a.get(x)?;
-                        //     match &hc.v2e[v] {
-                        //         SymExpr::Const(Literal::Bool(true)) => None,
-                        //         _ => Some((*m, a)),
-                        //     }
-                        // }
-                        // Guard::Always => Some((*m, a)),
-                        _ => Some((*m, a)),
+                        Guard::IfTrue(x) => {
+                            // If the guard variable is undefined, we
+                            // can go sicko mode
+                            let v = a.get(x)?;
+                            if let Some(Literal::Bool(false)) = &eg[*v].data.value {
+                                None
+                            } else {
+                                Some((*m, a))
+                            }
+                        }
+                        Guard::IfFalse(x) => {
+                            let v = a.get(x)?;
+                            if let Some(Literal::Bool(true)) = &eg[*v].data.value {
+                                None
+                            } else {
+                                Some((*m, a))
+                            }
+                        }
+                        Guard::Always => Some((*m, a)),
                     }
                 })
                 .collect();
@@ -361,9 +412,13 @@ pub fn compute_ssa(func: &Function) {
             if let Some(mut astore) = astore {
                 // Symbolically execute the block
                 for (j, inst) in cfg.blocks[i].insts.iter().enumerate() {
-                    let iloc = (n, j);
+                    let iloc = ILoc(n, j);
                     step_symbolic(inst, iloc, &mut gvg, &mut astore, &mut eg);
                 }
+                // Apply rewrites
+                let runner = egg::Runner::default().with_egraph(eg);
+                let runner = runner.run(&rws);
+                eg = runner.egraph;
                 // If something changed, push successors
                 let astore = Some(astore);
                 if astore != abs[&n] {
@@ -387,10 +442,50 @@ pub fn compute_ssa(func: &Function) {
     }
 
     // Run rewrites
-    let rws = rules();
+    rws.extend(conditional_rules());
     let runner = egg::Runner::default().with_egraph(eg);
     let runner = runner.run(&rws);
     let eg = runner.egraph;
+
+    for i in 0..cfg.blocks.len() {
+        let node = Node::Block(i);
+        if let Some(store) = &abs[&node] {
+            // Extract state at the end of the block
+            let state = store[&state_var()];
+            let ex = Extractor::new(&eg, CostFn {});
+            let (cost, state_opt) = ex.find_best(state);
+            eprintln!("state @ {node:?}: {state_opt} (cost: {cost})");
+            eprintln!("linearized:");
+            for (j, e) in state_opt.as_ref().iter().enumerate() {
+                if e.is_leaf() {
+                    continue;
+                }
+                eprint!("  %{j} = {e}");
+                for c in e.children() {
+                    if state_opt[*c].is_leaf() {
+                        eprint!(" {}", state_opt[*c]);
+                    } else {
+                        eprint!(" %{c}");
+                    }
+                }
+                eprintln!();
+            }
+            expr_dot(&state_opt, format!("dot/{}_state_{}.dot", func.name, i)).unwrap();
+        } else {
+            eprintln!("unreachable block {i}");
+            eprintln!("{}", cfg.blocks[i]);
+        }
+    }
+
+    // Print eclasses and associated analysis data
+    {
+        let mut cs: Vec<_> = eg.classes().collect();
+        cs.sort_by_key(|c| c.id);
+        for c in cs {
+            eprintln!("{}: {:?}", c.id, &c.nodes);
+            eprintln!("{:?}", &c.data);
+        }
+    }
 
     // Write hashcons to dot
     {

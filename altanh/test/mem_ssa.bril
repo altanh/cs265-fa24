@@ -1,0 +1,21 @@
+# Demonstration of pointer analysis resulting in refined reachability
+@mem_ssa {
+    zero: int = const 0;
+    one: int = const 1;
+    p: ptr<int> = alloc one;
+    # q: ptr<int> = ptradd p zero;
+    q: ptr<int> = alloc one;
+    store p zero;
+    store q one;
+    x: int = load p;
+    b: bool = eq x zero;
+    br b .then .else;
+.then:
+    y: int = const 10;
+    jmp .end;
+.else:
+    y: int = const 20;
+    jmp .end;
+.end:
+    print y;
+}

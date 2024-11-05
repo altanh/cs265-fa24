@@ -1,0 +1,38 @@
+@trivial_mem(x: int) {
+    one: int = const 1;
+    two: int = add one one;
+    zero: int = sub x x;
+    p: ptr<int> = alloc two;
+    store p one;
+    just_p: ptr<int> = ptradd p zero;
+    store just_p two;
+    just_two: int = load p;
+    print just_two;
+    store p one;
+    p2: ptr<int> = ptradd p one;
+    store p2 two;
+    not_just_one: int = load p;
+}
+
+@merge_mem(x: int) {
+    zero: int = sub x x;
+    isz: bool = eq x zero;
+    br isz .L0 .L1;
+.L0:
+    p: ptr<int> = alloc x;
+    store p zero;
+    store p x;
+    v: int = id x;
+    jmp .L2;
+.L1:
+    p: ptr<int> = alloc x;
+    store p x;
+    v: int = load p;
+    # this shouldn't affect memory, but we have a single state token for both
+    # memory and IO, so we can't merge easily here
+    # print p;
+    jmp .L2;
+.L2:
+    store p zero;
+    print v;
+}
